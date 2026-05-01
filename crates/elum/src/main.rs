@@ -1,4 +1,5 @@
 mod app;
+mod assets;
 mod host_book;
 
 use std::path::PathBuf;
@@ -43,24 +44,26 @@ fn main() {
     }
   }
 
-  gpui_platform::application().run(move |cx: &mut App| {
-    elum_terminal::view::register_default_keybindings(cx);
-    app::register_default_keybindings(cx);
+  gpui_platform::application()
+    .with_assets(assets::ElumAssets)
+    .run(move |cx: &mut App| {
+      elum_terminal::view::register_default_keybindings(cx);
+      app::register_default_keybindings(cx);
 
-    let opts = WindowOptions {
-      window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-        point(px(0.), px(0.)),
-        size(px(INITIAL_WIDTH_PX), px(INITIAL_HEIGHT_PX)),
-      ))),
-      ..Default::default()
-    };
-    cx.open_window(opts, move |_, cx| {
-      cx.new(move |cx| ElumApp::new(host_book, runtime, cx))
-    })
-    .unwrap();
+      let opts = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+          point(px(0.), px(0.)),
+          size(px(INITIAL_WIDTH_PX), px(INITIAL_HEIGHT_PX)),
+        ))),
+        ..Default::default()
+      };
+      cx.open_window(opts, move |_, cx| {
+        cx.new(move |cx| ElumApp::new(host_book, runtime, cx))
+      })
+      .unwrap();
 
-    cx.activate(true);
-  });
+      cx.activate(true);
+    });
 }
 
 /// First-launch seed: a host pointing at the local SSH test container so

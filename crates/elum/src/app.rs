@@ -31,6 +31,7 @@ use gpui::{
 };
 use tokio::runtime::Runtime;
 
+use crate::assets::{Icon, IconName};
 use crate::host_book::{Host, HostBook};
 
 actions!(
@@ -289,7 +290,7 @@ impl ElumApp {
             .on_click(cx.listener(move |this, _, _, cx| {
               this.close_tab_at(i, cx);
             }))
-            .child("×"),
+            .child(Icon::new(IconName::X).size(px(12.))),
         );
       bar = bar.child(entry);
     }
