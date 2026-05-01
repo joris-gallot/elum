@@ -1,38 +1,18 @@
-//! Top-level app shell: sidebar of hosts, tab bar, active terminal view.
-//!
-//! The app entity owns:
-//! - The persistent `HostBook` (loaded from disk at boot).
-//! - A `Vec<Tab>` of currently-open connections, each in one of three states
-//!   (`Connecting`, `Connected`, `Failed`).
-//! - A handle to the tokio runtime so it can spawn SSH connection tasks
-//!   without blocking the GPUI main thread.
-//!
-//! Each new tab spawns a tokio task to `Session::connect` + `open_shell`.
-//! When the task resolves, it updates the tab's state via `WeakEntity`
-//! back on the GPUI main thread, materializing a `TerminalView` entity.
-//!
-//! Keyboard:
-//! - Bindings under `key_context("ElumApp")` cover app-wide shortcuts
-//!   (close tab, switch tabs).
-//! - Bindings under `key_context("TerminalView")` (registered separately)
-//!   cover in-terminal copy/paste/select-all.
-//! - Action dispatch bubbles outward, so a focused terminal still receives
-//!   app-level shortcuts that don't conflict.
-
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use elum_ssh::{ConnectConfig, Session, ShellHandle};
 use elum_terminal::view::TerminalView;
 use elum_terminal::{GridSize, Terminal};
 use gpui::{
-  actions, div, px, rgb, AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable,
-  InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, SharedString,
-  StatefulInteractiveElement, Styled, Window,
+  actions, div, px, relative, AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable,
+  InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled, Window,
 };
 use tokio::runtime::Runtime;
 
-use crate::assets::{Icon, IconName};
 use crate::host_book::{Host, HostBook};
+use elum_ui::add_host_dialog::{self, NewHostInput};
+use elum_ui::UiIconName;
 
 actions!(
   elum,
@@ -50,30 +30,18 @@ actions!(
 
 /// Key context for app-level bindings. Bindings registered under this
 /// context fire from anywhere within the app (including focused terminals).
-pub const KEY_CONTEXT: &str = "ElumApp";
+/// Keystroke->action wiring lives in [`crate::keymap`].
+pub const KEY_CONTEXT: &str = "Workspace";
 
-pub fn register_default_keybindings(cx: &mut App) {
-  cx.bind_keys([
-    KeyBinding::new("cmd-w", CloseTab, Some(KEY_CONTEXT)),
-    KeyBinding::new("cmd-shift-]", NextTab, Some(KEY_CONTEXT)),
-    KeyBinding::new("cmd-shift-[", PrevTab, Some(KEY_CONTEXT)),
-    KeyBinding::new("cmd-q", Quit, None),
-  ]);
-}
-
-const SIDEBAR_WIDTH_PX: f32 = 200.0;
+const SIDEBAR_DEFAULT_WIDTH: f32 = 200.0;
+const SIDEBAR_MIN_WIDTH: f32 = 160.0;
+const SIDEBAR_MAX_WIDTH: f32 = 400.0;
 const TAB_BAR_HEIGHT_PX: f32 = 30.0;
-const SIDEBAR_BG: u32 = 0x1a1d23;
-const HOVER_BG: u32 = 0x252830;
-const ACCENT_BG: u32 = 0x101418;
-const TEXT_COLOR: u32 = 0xe6e6e6;
-const MUTED_TEXT_COLOR: u32 = 0x8b9099;
-const ERROR_TEXT_COLOR: u32 = 0xe06c75;
 
 const INITIAL_COLS: u16 = 80;
 const INITIAL_ROWS: u16 = 24;
 
-pub struct ElumApp {
+pub struct Workspace {
   host_book: HostBook,
   tabs: Vec<Tab>,
   active_tab: Option<usize>,
@@ -96,7 +64,7 @@ enum TabState {
   Failed { error: String },
 }
 
-impl ElumApp {
+impl Workspace {
   pub fn new(
     host_book: HostBook,
     runtime: Arc<Runtime>,
@@ -135,7 +103,7 @@ impl ElumApp {
     }
   }
 
-  fn connect_to_host(&mut self, host_idx: usize, _window: &mut Window, cx: &mut Context<Self>) {
+  fn connect_to_host(&mut self, host_idx: usize, cx: &mut Context<Self>) {
     let Some(host) = self.host_book.hosts().get(host_idx).cloned() else {
       return;
     };
@@ -251,100 +219,147 @@ impl ElumApp {
     cx.quit();
   }
 
-  fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
-    let header = div()
-      .px_3()
-      .py_2()
-      .text_color(rgb(MUTED_TEXT_COLOR))
-      .child(SharedString::from("Hosts"));
-
-    let mut sidebar = div()
-      .flex()
-      .flex_col()
-      .w(px(SIDEBAR_WIDTH_PX))
-      .h_full()
-      .bg(rgb(SIDEBAR_BG))
-      .child(header);
-
-    if self.host_book.is_empty() {
-      sidebar = sidebar.child(
-        div()
-          .px_3()
-          .py_2()
-          .text_color(rgb(MUTED_TEXT_COLOR))
-          .child("No hosts yet."),
-      );
-    } else {
-      for (i, host) in self.host_book.hosts().iter().enumerate() {
-        let row = div()
-          .id(("host-row", i))
-          .px_3()
-          .py_1p5()
-          .cursor_pointer()
-          .hover(|s| s.bg(rgb(HOVER_BG)))
-          .on_click(cx.listener(move |this, _, window, cx| {
-            this.connect_to_host(i, window, cx);
-          }))
-          .child(SharedString::from(host.name.clone()));
-        sidebar = sidebar.child(row);
-      }
+  /// Submit handler for the Add Host dialog. Owns ID generation and
+  /// persistence so the dialog itself stays domain-agnostic. Persists
+  /// immediately so a crash before the next save doesn't lose the
+  /// user's entry.
+  pub(crate) fn add_host_from_dialog(&mut self, input: NewHostInput, cx: &mut Context<Self>) {
+    let host = Host {
+      id: generate_host_id(),
+      name: input.name,
+      host: input.host,
+      port: input.port,
+      user: input.user,
+      key_path: input.key_path,
+    };
+    self.host_book.add(host);
+    if let Err(e) = self.host_book.save() {
+      eprintln!("warning: failed to persist host book: {e:#}");
     }
+    cx.notify();
+  }
 
-    sidebar.into_any_element()
+  fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+    use gpui_component::{
+      button::{Button, ButtonVariants as _},
+      sidebar::{Sidebar, SidebarHeader, SidebarMenu, SidebarMenuItem},
+      ActiveTheme as _, IconName as ComponentIconName, Sizable as _,
+    };
+
+    let view = cx.entity().downgrade();
+
+    let add_button = Button::new("add-host")
+      .icon(ComponentIconName::Plus)
+      .ghost()
+      .small()
+      .tooltip("Add host")
+      .on_click({
+        let view = view.clone();
+        move |_, window, cx| {
+          let view = view.clone();
+          add_host_dialog::open(window, cx, move |input, cx| {
+            let _ = view.update(cx, |app, cx| {
+              app.add_host_from_dialog(input, cx);
+            });
+          });
+        }
+      });
+
+    // SidebarHeader composes children horizontally; flex_1 on the label
+    // pushes the `+` button to the far right.
+    let header = SidebarHeader::new()
+      .child(
+        div()
+          .flex_1()
+          .text_color(cx.theme().muted_foreground)
+          .child(SharedString::from("Hosts")),
+      )
+      .child(add_button);
+
+    let menu = if self.host_book.is_empty() {
+      // `Sidebar::child` is constrained to `SidebarItem`, so the empty
+      // state has to live inside a SidebarMenu. A disabled item is the
+      // closest match for "informational placeholder".
+      SidebarMenu::new().child(SidebarMenuItem::new("No hosts yet.").disable(true))
+    } else {
+      SidebarMenu::new().children(self.host_book.hosts().iter().enumerate().map(|(i, host)| {
+        let view = view.clone();
+        SidebarMenuItem::new(SharedString::from(host.name.clone())).on_click(
+          move |_, _window, cx| {
+            let _ = view.update(cx, |this, cx| {
+              this.connect_to_host(i, cx);
+            });
+          },
+        )
+      }))
+    };
+
+    // `w(relative(1.))` makes the Sidebar fill its parent (the
+    // `resizable_panel`); without it Sidebar's default fixed width
+    // would conflict with the panel and produce stray borders/handles.
+    // `border_0()` removes the default right border since the resize
+    // handle already provides the visual divider.
+    Sidebar::new("hosts")
+      .w(relative(1.))
+      .border_0()
+      .header(header)
+      .child(menu)
+      .into_any_element()
   }
 
   fn render_tab_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-    let mut bar = div()
-      .flex()
-      .flex_row()
-      .h(px(TAB_BAR_HEIGHT_PX))
-      .bg(rgb(SIDEBAR_BG));
+    use gpui_component::{
+      button::{Button, ButtonVariants as _},
+      tab::{Tab, TabBar},
+      Sizable as _,
+    };
+
+    if self.tabs.is_empty() {
+      // Empty bar still gets rendered (for height stability) but with no
+      // tabs inside. Avoids `selected_index` panicking on a zero-tab bar.
+      return div().h(px(TAB_BAR_HEIGHT_PX)).into_any_element();
+    }
+
+    let mut bar = TabBar::new("workspace-tabs")
+      .selected_index(self.active_tab.unwrap_or(0))
+      .on_click(cx.listener(|this, ix: &usize, window, cx| {
+        this.activate_tab(*ix, window, cx);
+      }));
 
     for (i, tab) in self.tabs.iter().enumerate() {
-      let is_active = self.active_tab == Some(i);
-      let title = SharedString::from(tab.host.name.clone());
-      let entry = div()
-        .id(("tab", tab.id as usize))
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_2()
-        .px_3()
-        .h_full()
-        .cursor_pointer()
-        .bg(if is_active {
-          rgb(ACCENT_BG)
-        } else {
-          rgb(SIDEBAR_BG)
-        })
+      let close_id = ("tab-close", tab.id as usize);
+      let close_button = Button::new(close_id)
+        .icon(UiIconName::X)
+        .ghost()
+        .xsmall()
         .on_click(cx.listener(move |this, _, window, cx| {
-          this.activate_tab(i, window, cx);
-        }))
-        .child(title)
-        .child(
-          div()
-            .id(("tab-close", tab.id as usize))
-            .px_1()
-            .text_color(rgb(MUTED_TEXT_COLOR))
-            .hover(|s| s.text_color(rgb(TEXT_COLOR)))
-            .on_click(cx.listener(move |this, _, window, cx| {
-              this.close_tab_at(i, window, cx);
-            }))
-            .child(Icon::new(IconName::X).size(px(12.))),
-        );
-      bar = bar.child(entry);
+          this.close_tab_at(i, window, cx);
+        }));
+
+      bar = bar.child(
+        Tab::new()
+          .label(SharedString::from(tab.host.name.clone()))
+          .suffix(close_button),
+      );
     }
+
     bar.into_any_element()
   }
 
-  fn render_active_body(&self, _cx: &mut Context<Self>) -> AnyElement {
+  fn render_active_body(&self, cx: &mut Context<Self>) -> AnyElement {
+    use gpui_component::ActiveTheme as _;
+
+    let theme = cx.theme();
+    let muted_fg = theme.muted_foreground;
+    let danger = theme.danger;
+
     let Some(idx) = self.active_tab else {
       return div()
         .flex()
         .flex_1()
         .items_center()
         .justify_center()
-        .text_color(rgb(MUTED_TEXT_COLOR))
+        .text_color(muted_fg)
         .child("Click a host in the sidebar to connect.")
         .into_any_element();
     };
@@ -357,7 +372,7 @@ impl ElumApp {
         .flex_1()
         .items_center()
         .justify_center()
-        .text_color(rgb(MUTED_TEXT_COLOR))
+        .text_color(muted_fg)
         .child(SharedString::from(format!(
           "Connecting to {}…",
           tab.host.name
@@ -370,14 +385,14 @@ impl ElumApp {
         .items_center()
         .justify_center()
         .gap_2()
-        .text_color(rgb(ERROR_TEXT_COLOR))
+        .text_color(danger)
         .child(SharedString::from(format!(
           "Failed to connect to {}",
           tab.host.name
         )))
         .child(
           div()
-            .text_color(rgb(MUTED_TEXT_COLOR))
+            .text_color(muted_fg)
             .child(SharedString::from(error.clone())),
         )
         .into_any_element(),
@@ -386,14 +401,32 @@ impl ElumApp {
   }
 }
 
-impl Focusable for ElumApp {
+impl Focusable for Workspace {
   fn focus_handle(&self, _cx: &App) -> FocusHandle {
     self.focus.clone()
   }
 }
 
-impl Render for ElumApp {
+impl Render for Workspace {
   fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    use gpui_component::{
+      resizable::{h_resizable, resizable_panel},
+      ActiveTheme as _,
+    };
+
+    let theme = cx.theme();
+    let background = theme.background;
+    let foreground = theme.foreground;
+
+    let main = div()
+      .flex()
+      .flex_col()
+      .flex_1()
+      .h_full()
+      .child(self.render_tab_bar(cx))
+      .child(self.render_active_body(cx))
+      .into_any_element();
+
     div()
       .key_context(KEY_CONTEXT)
       .track_focus(&self.focus)
@@ -401,19 +434,33 @@ impl Render for ElumApp {
       .on_action(cx.listener(Self::on_next_tab))
       .on_action(cx.listener(Self::on_prev_tab))
       .on_action(cx.listener(Self::on_quit))
-      .flex()
-      .flex_row()
       .size_full()
-      .bg(rgb(ACCENT_BG))
-      .text_color(rgb(TEXT_COLOR))
-      .child(self.render_sidebar(cx))
+      .bg(background)
+      .text_color(foreground)
       .child(
-        div()
-          .flex()
-          .flex_col()
-          .flex_1()
-          .child(self.render_tab_bar(cx))
-          .child(self.render_active_body(cx)),
+        // Pattern from gpui-component's gallery: only the sidebar gets a
+        // `resizable_panel` (fixed initial size + min/max). The right
+        // pane is passed as a raw element so it absorbs remaining space
+        // without an extra resize handle showing up between them.
+        h_resizable("workspace-split")
+          .child(
+            resizable_panel()
+              .size(px(SIDEBAR_DEFAULT_WIDTH))
+              .size_range(px(SIDEBAR_MIN_WIDTH)..px(SIDEBAR_MAX_WIDTH))
+              .child(self.render_sidebar(cx)),
+          )
+          .child(main),
       )
   }
+}
+
+/// Generate a stable-enough host ID from the wall clock. Collisions are
+/// effectively impossible for human-paced "Add Host" use; a UUID dep
+/// would be overkill until we need stronger guarantees.
+fn generate_host_id() -> String {
+  let ms = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|d| d.as_millis())
+    .unwrap_or(0);
+  format!("host-{ms}")
 }

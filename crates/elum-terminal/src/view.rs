@@ -10,13 +10,14 @@
 use std::sync::Arc;
 
 use gpui::{
-  actions, div, px, App, ClipboardItem, Context, FocusHandle, Focusable, InteractiveElement,
-  IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+  actions, div, px, ClipboardItem, Context, FocusHandle, Focusable, InteractiveElement,
+  IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
   ParentElement, Pixels, Point, Render, ScrollWheelEvent, Styled, Task, Window,
 };
 
-// Terminal view editing actions. Bound to keystrokes by the binary at
-// startup; rebindable in the future via a keymap config.
+// Terminal view editing actions. Keystroke wiring lives in the
+// workspace's keymap module; this crate only owns action definitions
+// and the focus context they're scoped to.
 actions!(
   elum_terminal,
   [
@@ -33,17 +34,6 @@ actions!(
 /// Key context name for the terminal view. Set via `key_context()` on the
 /// root div; matched by `KeyBinding::new(keys, action, Some(KEY_CONTEXT))`.
 pub const KEY_CONTEXT: &str = "TerminalView";
-
-/// Install the default Cmd-* shortcuts for the terminal view (Copy, Paste,
-/// SelectAll on macOS-style modifier). Call once at app startup. The
-/// binary can override or extend by calling `cx.bind_keys(...)` afterwards.
-pub fn register_default_keybindings(cx: &mut App) {
-  cx.bind_keys([
-    KeyBinding::new("cmd-c", Copy, Some(KEY_CONTEXT)),
-    KeyBinding::new("cmd-v", Paste, Some(KEY_CONTEXT)),
-    KeyBinding::new("cmd-a", SelectAll, Some(KEY_CONTEXT)),
-  ]);
-}
 
 use crate::colors::{default_background, default_foreground};
 use crate::element::TerminalElement;
