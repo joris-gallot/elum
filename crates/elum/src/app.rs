@@ -43,6 +43,8 @@ actions!(
     NextTab,
     /// Switch to the previous tab (wraps around).
     PrevTab,
+    /// Quit the application.
+    Quit,
   ]
 );
 
@@ -55,6 +57,7 @@ pub fn register_default_keybindings(cx: &mut App) {
     KeyBinding::new("cmd-w", CloseTab, Some(KEY_CONTEXT)),
     KeyBinding::new("cmd-shift-]", NextTab, Some(KEY_CONTEXT)),
     KeyBinding::new("cmd-shift-[", PrevTab, Some(KEY_CONTEXT)),
+    KeyBinding::new("cmd-q", Quit, None),
   ]);
 }
 
@@ -94,18 +97,45 @@ enum TabState {
 }
 
 impl ElumApp {
-  pub fn new(host_book: HostBook, runtime: Arc<Runtime>, cx: &mut Context<Self>) -> Self {
+  pub fn new(
+    host_book: HostBook,
+    runtime: Arc<Runtime>,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) -> Self {
+    let focus = cx.focus_handle();
+    // Focus the app on init so keybindings dispatch immediately, before
+    // the user has clicked anything. When a tab becomes active we hand
+    // focus down to its TerminalView.
+    window.focus(&focus, cx);
     Self {
       host_book,
       tabs: Vec::new(),
       active_tab: None,
       runtime,
       next_tab_id: 1,
-      focus: cx.focus_handle(),
+      focus,
     }
   }
 
-  fn connect_to_host(&mut self, host_idx: usize, cx: &mut Context<Self>) {
+  /// Focus the active tab's `TerminalView`, if any. Falls back to the app
+  /// focus handle when there is no active tab or the tab isn't connected
+  /// yet, so keystrokes always have somewhere to land.
+  fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
+    let view_focus = self
+      .active_tab
+      .and_then(|i| self.tabs.get(i))
+      .and_then(|tab| match &tab.state {
+        TabState::Connected { view } => Some(view.read(cx).focus_handle(cx)),
+        _ => None,
+      });
+    match view_focus {
+      Some(handle) => window.focus(&handle, cx),
+      None => window.focus(&self.focus, cx),
+    }
+  }
+
+  fn connect_to_host(&mut self, host_idx: usize, _window: &mut Window, cx: &mut Context<Self>) {
     let Some(host) = self.host_book.hosts().get(host_idx).cloned() else {
       return;
     };
@@ -172,14 +202,15 @@ impl ElumApp {
     cx.notify();
   }
 
-  fn activate_tab(&mut self, idx: usize, cx: &mut Context<Self>) {
+  fn activate_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
     if idx < self.tabs.len() && self.active_tab != Some(idx) {
       self.active_tab = Some(idx);
+      self.focus_active(window, cx);
       cx.notify();
     }
   }
 
-  fn close_tab_at(&mut self, idx: usize, cx: &mut Context<Self>) {
+  fn close_tab_at(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
     if idx >= self.tabs.len() {
       return;
     }
@@ -189,30 +220,35 @@ impl ElumApp {
     } else {
       Some(self.active_tab.map_or(0, |a| a.min(self.tabs.len() - 1)))
     };
+    self.focus_active(window, cx);
     cx.notify();
   }
 
-  fn on_close_tab(&mut self, _: &CloseTab, _w: &mut Window, cx: &mut Context<Self>) {
+  fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
     if let Some(idx) = self.active_tab {
-      self.close_tab_at(idx, cx);
+      self.close_tab_at(idx, window, cx);
     }
   }
 
-  fn on_next_tab(&mut self, _: &NextTab, _w: &mut Window, cx: &mut Context<Self>) {
+  fn on_next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
     if self.tabs.is_empty() {
       return;
     }
     let next = self.active_tab.map_or(0, |a| (a + 1) % self.tabs.len());
-    self.activate_tab(next, cx);
+    self.activate_tab(next, window, cx);
   }
 
-  fn on_prev_tab(&mut self, _: &PrevTab, _w: &mut Window, cx: &mut Context<Self>) {
+  fn on_prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
     if self.tabs.is_empty() {
       return;
     }
     let len = self.tabs.len();
     let prev = self.active_tab.map_or(len - 1, |a| (a + len - 1) % len);
-    self.activate_tab(prev, cx);
+    self.activate_tab(prev, window, cx);
+  }
+
+  fn on_quit(&mut self, _: &Quit, _w: &mut Window, cx: &mut Context<Self>) {
+    cx.quit();
   }
 
   fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -246,7 +282,9 @@ impl ElumApp {
           .py_1p5()
           .cursor_pointer()
           .hover(|s| s.bg(rgb(HOVER_BG)))
-          .on_click(cx.listener(move |this, _, _, cx| this.connect_to_host(i, cx)))
+          .on_click(cx.listener(move |this, _, window, cx| {
+            this.connect_to_host(i, window, cx);
+          }))
           .child(SharedString::from(host.name.clone()));
         sidebar = sidebar.child(row);
       }
@@ -279,7 +317,9 @@ impl ElumApp {
         } else {
           rgb(SIDEBAR_BG)
         })
-        .on_click(cx.listener(move |this, _, _, cx| this.activate_tab(i, cx)))
+        .on_click(cx.listener(move |this, _, window, cx| {
+          this.activate_tab(i, window, cx);
+        }))
         .child(title)
         .child(
           div()
@@ -287,8 +327,8 @@ impl ElumApp {
             .px_1()
             .text_color(rgb(MUTED_TEXT_COLOR))
             .hover(|s| s.text_color(rgb(TEXT_COLOR)))
-            .on_click(cx.listener(move |this, _, _, cx| {
-              this.close_tab_at(i, cx);
+            .on_click(cx.listener(move |this, _, window, cx| {
+              this.close_tab_at(i, window, cx);
             }))
             .child(Icon::new(IconName::X).size(px(12.))),
         );
@@ -360,6 +400,7 @@ impl Render for ElumApp {
       .on_action(cx.listener(Self::on_close_tab))
       .on_action(cx.listener(Self::on_next_tab))
       .on_action(cx.listener(Self::on_prev_tab))
+      .on_action(cx.listener(Self::on_quit))
       .flex()
       .flex_row()
       .size_full()

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use app::ElumApp;
-use gpui::{point, px, size, App, AppContext, Bounds, WindowBounds, WindowOptions};
+use gpui::{px, size, App, AppContext, Bounds, WindowBounds, WindowOptions};
 use host_book::{Host, HostBook};
 
 const INITIAL_WIDTH_PX: f32 = 900.0;
@@ -50,15 +50,23 @@ fn main() {
       elum_terminal::view::register_default_keybindings(cx);
       app::register_default_keybindings(cx);
 
+      // Closing the last window quits the app, matching macOS expectations
+      // for a single-window utility (vs. document-based apps that stay
+      // resident in the dock).
+      cx.on_window_closed(|cx, _| {
+        if cx.windows().is_empty() {
+          cx.quit();
+        }
+      })
+      .detach();
+
+      let bounds = Bounds::centered(None, size(px(INITIAL_WIDTH_PX), px(INITIAL_HEIGHT_PX)), cx);
       let opts = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-          point(px(0.), px(0.)),
-          size(px(INITIAL_WIDTH_PX), px(INITIAL_HEIGHT_PX)),
-        ))),
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
         ..Default::default()
       };
-      cx.open_window(opts, move |_, cx| {
-        cx.new(move |cx| ElumApp::new(host_book, runtime, cx))
+      cx.open_window(opts, move |window, cx| {
+        cx.new(move |cx| ElumApp::new(host_book, runtime, window, cx))
       })
       .unwrap();
 
