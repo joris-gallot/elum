@@ -1,0 +1,13 @@
+[package]
+name = "elum-ssh"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[dependencies]
+russh = { version = "0.60", features = ["aws-lc-rs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time"] }
+flume = "0.11"
+anyhow = "1"

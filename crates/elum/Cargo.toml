@@ -1,0 +1,22 @@
+[package]
+name = "elum"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[lints]
+workspace = true
+
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform", features = [
+  "font-kit",
+  "x11",
+  "wayland",
+  "runtime_shaders",
+] }
+
+elum-terminal = { path = "../elum-terminal" }
+elum-ssh = { path = "../elum-ssh" }
+
+tokio = { version = "1", features = ["rt-multi-thread"] }

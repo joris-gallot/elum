@@ -1,0 +1,17 @@
+# Local SSH server for Elum integration tests.
+# Bring up:   docker compose -f docker/sshd/compose.yml up -d
+# Bring down: docker compose -f docker/sshd/compose.yml down
+
+services:
+  sshd:
+    build: .
+    container_name: elum-sshd-test
+    ports:
+      - "127.0.0.1:2222:22"   # bind to loopback only - not exposed to LAN
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "22"]
+      interval: 2s
+      timeout: 1s
+      retries: 5
+      start_period: 1s
+    restart: unless-stopped

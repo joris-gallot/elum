@@ -1,0 +1,19 @@
+[workspace]
+members = ["crates/*"]
+default-members = ["crates/elum"]
+resolver = "2"
+
+[workspace.lints.clippy]
+redundant_clone = "warn"
+inefficient_to_string = "warn"
+manual_let_else = "warn"
+semicolon_if_nothing_returned = "warn"
+cloned_instead_of_copied = "warn"
+implicit_clone = "warn"
+needless_continue = "warn"
+uninlined_format_args = "warn"
+map_unwrap_or = "warn"
+flat_map_option = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
