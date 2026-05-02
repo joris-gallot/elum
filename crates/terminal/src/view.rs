@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use gpui::{
-  actions, div, px, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
+  actions, div, px, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
   InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels, Point, Render,
   ScrollWheelEvent, Styled, Task, Window,
 };
@@ -34,10 +34,6 @@ use crate::{GridSize, Terminal};
 const FONT_SIZE: f32 = 13.0;
 const FONT_FAMILY: &str = "Menlo";
 const LINE_HEIGHT_RATIO: f32 = 1.3;
-/// Heuristic glyph advance for `FONT_FAMILY` at `FONT_SIZE`. Used only to
-/// compute viewport → grid cell counts; the element itself uses real
-/// font metrics for paint, so a small mismatch just rounds rows/cols.
-const APPROX_CELL_WIDTH: f32 = 7.8;
 const PADDING: f32 = 8.0;
 const MIN_COLS: u16 = 10;
 const MIN_ROWS: u16 = 5;
@@ -94,6 +90,10 @@ pub struct TerminalView {
   to_remote: flume::Sender<Vec<u8>>,
   resize_remote: flume::Sender<(u16, u16)>,
   last_size: Option<(u16, u16)>,
+  /// Real cell metrics measured by the element on the most recent paint.
+  /// `None` only before the first frame; `pixel_to_cell` falls back to a
+  /// heuristic in that brief window.
+  last_cell_metrics: Option<(Pixels, Pixels)>,
   /// Sub-line accumulator for `ScrollWheelEvent` pixel deltas.
   scroll_px_acc: f32,
   selection: Option<Selection>,
@@ -137,6 +137,7 @@ impl TerminalView {
       to_remote,
       resize_remote,
       last_size: None,
+      last_cell_metrics: None,
       scroll_px_acc: 0.0,
       selection: None,
       focus,
@@ -375,14 +376,18 @@ impl TerminalView {
   }
 
   /// Convert an element-local point (origin at the hitbox top-left, i.e.
-  /// the cell grid origin) to a `(row, col)` display cell. The element
-  /// uses real font metrics for paint, so a small mismatch with these
-  /// approximate constants just rounds rows/cols.
+  /// the cell grid origin) to a `(row, col)` display cell, using the cell
+  /// metrics measured during the most recent paint. Falls back to a
+  /// crude heuristic only if no paint has happened yet (clicks landing
+  /// before the first frame are vanishingly rare in practice).
   fn pixel_to_cell(&self, pos: Point<Pixels>) -> (usize, usize) {
+    let (cell_w, line_h) = self.last_cell_metrics.map_or(
+      (FONT_SIZE * 0.6, FONT_SIZE * LINE_HEIGHT_RATIO),
+      |(w, h)| (f32::from(w), f32::from(h)),
+    );
     let x = f32::from(pos.x).max(0.0);
     let y = f32::from(pos.y).max(0.0);
-    let line_h = FONT_SIZE * LINE_HEIGHT_RATIO;
-    let col = (x / APPROX_CELL_WIDTH) as usize;
+    let col = (x / cell_w) as usize;
     let row = (y / line_h) as usize;
     // Clamp to the current grid so the user can't anchor outside it.
     let (rows, cols) = self.last_size.unwrap_or((24, 80));
@@ -446,15 +451,26 @@ impl TerminalView {
     }
   }
 
-  /// Compute a grid size that fits the current viewport and propagate
-  /// changes to both the alacritty model and the SSH PTY.
-  fn sync_size_to_viewport(&mut self, window: &Window) {
-    let viewport = window.viewport_size();
-    let avail_w = (f32::from(viewport.width) - 2.0 * PADDING).max(0.0);
-    let avail_h = (f32::from(viewport.height) - 2.0 * PADDING).max(0.0);
-    let line_h = FONT_SIZE * LINE_HEIGHT_RATIO;
-    let cols = ((avail_w / APPROX_CELL_WIDTH).floor() as u16).max(MIN_COLS);
-    let rows = ((avail_h / line_h).floor() as u16).max(MIN_ROWS);
+  /// Called by [`crate::element::TerminalElement`] every prepaint with the
+  /// real bounds of the terminal area and the real per-cell metrics from
+  /// the cascaded font. Owns the resize policy: clamps to `MIN_COLS`/
+  /// `MIN_ROWS`, resizes alacritty's grid, and forwards the new size to
+  /// the SSH PTY when it actually changed.
+  pub(crate) fn sync_metrics(
+    &mut self,
+    cell_width: Pixels,
+    line_height: Pixels,
+    bounds: Bounds<Pixels>,
+  ) {
+    self.last_cell_metrics = Some((cell_width, line_height));
+
+    let cell_w = f32::from(cell_width);
+    let line_h = f32::from(line_height);
+    if cell_w <= 0.0 || line_h <= 0.0 {
+      return;
+    }
+    let cols = ((f32::from(bounds.size.width) / cell_w).floor() as u16).max(MIN_COLS);
+    let rows = ((f32::from(bounds.size.height) / line_h).floor() as u16).max(MIN_ROWS);
     let next = (rows, cols);
 
     if Some(next) != self.last_size {
@@ -519,9 +535,11 @@ fn line_bounds(
 }
 
 impl Render for TerminalView {
-  fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-    self.sync_size_to_viewport(window);
-
+  fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    // Resize is driven by `TerminalElement::prepaint` via `sync_metrics`,
+    // since only the element knows the real per-cell metrics + the real
+    // bounds. The view just hands its current selection down to the
+    // element on each render.
     div()
       .id("terminal-view")
       .key_context(KEY_CONTEXT)

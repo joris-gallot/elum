@@ -124,6 +124,13 @@ impl Element for TerminalElement {
       .advance(font_id, font_size, 'M')
       .map_or_else(|_| px(f32::from(font_size) * 0.6), |adv| adv.width);
 
+    // Sync the grid size + PTY size to the *real* bounds we got from
+    // layout, using the *real* cell metrics. This must happen before we
+    // snapshot the grid so the snapshot reflects the post-resize state.
+    let _ = self.view.update(cx, |view, _| {
+      view.sync_metrics(cell_width, line_height, bounds);
+    });
+
     let snapshot = self.terminal.snapshot_grid();
     let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
