@@ -42,10 +42,19 @@ const PADDING: f32 = 8.0;
 const MIN_COLS: u16 = 10;
 const MIN_ROWS: u16 = 5;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionMode {
+  Cell,
+  Word,
+  Line,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Selection {
   pub anchor: (usize, usize),
   pub focus: (usize, usize),
+  pub origin: (usize, usize),
+  pub mode: SelectionMode,
   pub dragging: bool,
 }
 
@@ -208,6 +217,8 @@ impl TerminalView {
     self.selection = Some(Selection {
       anchor: (0, 0),
       focus: (last_row, cols),
+      origin: (0, 0),
+      mode: SelectionMode::Cell,
       dragging: false,
     });
     cx.notify();
@@ -234,16 +245,22 @@ impl TerminalView {
 
     self.selection = match click_count {
       0 | 1 if shift => {
-        let anchor = self.selection.map_or(cell, |s| s.anchor);
+        let (anchor, origin) = self
+          .selection
+          .map_or((cell, cell), |s| (s.anchor, s.origin));
         Some(Selection {
           anchor,
           focus: cell,
+          origin,
+          mode: SelectionMode::Cell,
           dragging: false,
         })
       }
       0 | 1 => Some(Selection {
         anchor: cell,
         focus: cell,
+        origin: cell,
+        mode: SelectionMode::Cell,
         dragging: true,
       }),
       2 => self.word_selection_at(cell),
@@ -252,61 +269,96 @@ impl TerminalView {
     cx.notify();
   }
 
-  /// Returns a selection covering the word that contains `(row, col)`,
-  /// where "word" is a run of identifier-like characters (alphanumeric +
-  /// `_-./~`). Whitespace cells return a single-cell selection.
-  fn word_selection_at(&self, (row, col): (usize, usize)) -> Option<Selection> {
+  /// Word-mode selection seeded at `(row, col)`. Drag enabled so the user
+  /// can extend by whole-word increments (handled in [`Self::on_pointer_move`]).
+  fn word_selection_at(&self, cell: (usize, usize)) -> Option<Selection> {
     let snapshot = self.terminal.snapshot_grid();
-    let row_cells = snapshot.rows.get(row)?;
-    let center = row_cells.get(col)?;
-    if !is_word_char(center.c) {
-      return Some(Selection {
-        anchor: (row, col),
-        focus: (row, col + 1),
-        dragging: false,
-      });
-    }
-    let mut start = col;
-    while start > 0
-      && row_cells
-        .get(start - 1)
-        .is_some_and(|cell| is_word_char(cell.c))
-    {
-      start -= 1;
-    }
-    let mut end = col;
-    while end < row_cells.len() && is_word_char(row_cells[end].c) {
-      end += 1;
-    }
+    let (anchor, focus) = word_bounds(&snapshot, cell)?;
     Some(Selection {
-      anchor: (row, start),
-      focus: (row, end),
-      dragging: false,
+      anchor,
+      focus,
+      origin: cell,
+      mode: SelectionMode::Word,
+      dragging: true,
     })
   }
 
-  fn line_selection_at(&self, (row, _): (usize, usize)) -> Option<Selection> {
+  /// Line-mode selection seeded at `(row, _)`. Drag enabled so the user
+  /// can extend across whole lines.
+  fn line_selection_at(&self, cell: (usize, usize)) -> Option<Selection> {
     let snapshot = self.terminal.snapshot_grid();
-    let row_cells = snapshot.rows.get(row)?;
+    let (anchor, focus) = line_bounds(&snapshot, cell)?;
     Some(Selection {
-      anchor: (row, 0),
-      focus: (row, row_cells.len()),
-      dragging: false,
+      anchor,
+      focus,
+      origin: cell,
+      mode: SelectionMode::Line,
+      dragging: true,
     })
   }
 
   pub(crate) fn on_pointer_move(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
-    if !self.selection.is_some_and(|s| s.dragging) {
+    let Some(sel) = self.selection else {
+      return;
+    };
+    if !sel.dragging {
       return;
     }
-    // Compute the cell first to release the immutable borrow on `self`
-    // before mutating the selection.
-    let cell = self.pixel_to_cell(pos);
-    if let Some(sel) = self.selection.as_mut() {
-      if cell != sel.focus {
-        sel.focus = cell;
-        cx.notify();
+    let pointer = self.pixel_to_cell(pos);
+
+    // For Word/Line modes we need a fresh snapshot to recompute snapped
+    // bounds. For Cell mode, the pointer cell is the focus.
+    let new = match sel.mode {
+      SelectionMode::Cell => Selection {
+        anchor: sel.anchor,
+        focus: pointer,
+        origin: sel.origin,
+        mode: SelectionMode::Cell,
+        dragging: true,
+      },
+      SelectionMode::Word => {
+        let snapshot = self.terminal.snapshot_grid();
+        let (origin_start, origin_end) =
+          word_bounds(&snapshot, sel.origin).unwrap_or((sel.origin, sel.origin));
+        let (pointer_start, pointer_end) =
+          word_bounds(&snapshot, pointer).unwrap_or((pointer, pointer));
+        let (anchor, focus) = if pointer >= sel.origin {
+          (origin_start, pointer_end)
+        } else {
+          (pointer_start, origin_end)
+        };
+        Selection {
+          anchor,
+          focus,
+          origin: sel.origin,
+          mode: SelectionMode::Word,
+          dragging: true,
+        }
       }
+      SelectionMode::Line => {
+        let snapshot = self.terminal.snapshot_grid();
+        let (origin_start, origin_end) =
+          line_bounds(&snapshot, sel.origin).unwrap_or((sel.origin, sel.origin));
+        let (pointer_start, pointer_end) =
+          line_bounds(&snapshot, pointer).unwrap_or((pointer, pointer));
+        let (anchor, focus) = if pointer.0 >= sel.origin.0 {
+          (origin_start, pointer_end)
+        } else {
+          (pointer_start, origin_end)
+        };
+        Selection {
+          anchor,
+          focus,
+          origin: sel.origin,
+          mode: SelectionMode::Line,
+          dragging: true,
+        }
+      }
+    };
+
+    if (new.anchor, new.focus) != (sel.anchor, sel.focus) {
+      self.selection = Some(new);
+      cx.notify();
     }
   }
 
@@ -429,6 +481,43 @@ fn is_word_char(c: char) -> bool {
   c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~' | ':')
 }
 
+/// Word bounds (inclusive start, exclusive end) of the run containing
+/// `(row, col)`. Whitespace cells return a single-cell range so the user
+/// still sees feedback. `None` if the cell is out of grid range.
+fn word_bounds(
+  snapshot: &crate::GridSnapshot,
+  (row, col): (usize, usize),
+) -> Option<((usize, usize), (usize, usize))> {
+  let row_cells = snapshot.rows.get(row)?;
+  let center = row_cells.get(col)?;
+  if !is_word_char(center.c) {
+    return Some(((row, col), (row, col + 1)));
+  }
+  let mut start = col;
+  while start > 0
+    && row_cells
+      .get(start - 1)
+      .is_some_and(|cell| is_word_char(cell.c))
+  {
+    start -= 1;
+  }
+  let mut end = col;
+  while end < row_cells.len() && is_word_char(row_cells[end].c) {
+    end += 1;
+  }
+  Some(((row, start), (row, end)))
+}
+
+/// Line bounds (col 0 to row length) for the row of `(row, _)`. `None` if
+/// the row is out of range.
+fn line_bounds(
+  snapshot: &crate::GridSnapshot,
+  (row, _): (usize, usize),
+) -> Option<((usize, usize), (usize, usize))> {
+  let row_cells = snapshot.rows.get(row)?;
+  Some(((row, 0), (row, row_cells.len())))
+}
+
 impl Render for TerminalView {
   fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
     self.sync_size_to_viewport(window);
@@ -464,6 +553,8 @@ mod selection_tests {
     Selection {
       anchor,
       focus,
+      origin: anchor,
+      mode: SelectionMode::Cell,
       dragging: false,
     }
   }
