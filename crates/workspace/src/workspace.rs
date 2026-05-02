@@ -75,6 +75,7 @@ struct Tab {
   host: Host,
   state: TabState,
   has_bell: bool,
+  terminal_title: Option<String>,
   /// Subscription to the [`TerminalView`]'s `ShellClosed` event. Held in
   /// the tab so it stays alive for as long as the tab does
   _shell_closed: Option<Subscription>,
@@ -135,6 +136,7 @@ impl Workspace {
       host: host.clone(),
       state: TabState::Connecting,
       has_bell: false,
+      terminal_title: None,
       _shell_closed: None,
     });
     self.active_tab = Some(self.tabs.len() - 1);
@@ -391,6 +393,12 @@ impl Workspace {
                   tab.has_bell = true;
                   cx.notify();
                 }
+              }
+            }
+            TerminalEvent::TitleChanged(title) => {
+              if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
+                tab.terminal_title = title.as_ref().filter(|s| !s.is_empty()).cloned();
+                cx.notify();
               }
             }
           },
@@ -673,8 +681,14 @@ impl Workspace {
           this.close_tab_at(i, window, cx);
         }));
 
+      let label = tab
+        .terminal_title
+        .as_ref()
+        .filter(|title| !title.is_empty())
+        .unwrap_or(&tab.host.name);
+
       let tab_el = ComponentTab::new()
-        .label(SharedString::from(tab.host.name.clone()))
+        .label(SharedString::from(label.to_string()))
         .suffix(close_button)
         .when(tab.has_bell, |tab| {
           tab.prefix(

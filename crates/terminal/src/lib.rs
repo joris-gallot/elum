@@ -1,5 +1,5 @@
-//! Terminal data model: wraps `alacritty_terminal::Term` and exposes a
-//! source-agnostic `write(bytes)` API. The model knows nothing about SSH,
+//! Terminal data model: wraps `alacritty_terminal::Term` and exposes
+//! source-agnostic write APIs. The model knows nothing about SSH,
 //! PTYs, or rendering, those concerns belong to other crates.
 
 pub mod colors;
@@ -12,6 +12,7 @@ use std::sync::Arc;
 use alacritty_terminal::{
   event::{Event as AlacEvent, EventListener},
   grid::Dimensions,
+  term::color,
   term::Config,
   vte::ansi::{Processor, StdSyncHandler},
   Term,
@@ -72,8 +73,9 @@ impl EventListener for ChannelListener {
   }
 }
 
-/// Source-agnostic terminal model. Feed it bytes via [`Terminal::write`];
-/// inspect the grid via [`Terminal::with_term`].
+/// Source-agnostic terminal model. Feed display text via [`Terminal::write`]
+/// or raw PTY bytes via [`Terminal::write_remote`]; inspect the grid via
+/// [`Terminal::with_term`].
 pub struct Terminal {
   term: Arc<FairMutex<Term<ChannelListener>>>,
   processor: FairMutex<Processor<StdSyncHandler>>,
@@ -96,9 +98,11 @@ impl Terminal {
     }
   }
 
-  /// Feed output bytes into the terminal. Bare `\n` is normalized to `\r\n`
-  /// so that line feeds advance the cursor to column 0 (terminals expect
-  /// CRLF; SSH and PTYs sometimes don't honor that).
+  /// Feed display text into the terminal. Bare `\n` is normalized to `\r\n`
+  /// so debug/display-only output starts the next line at column 0.
+  ///
+  /// Do not use this for bytes coming from a real PTY/SSH channel; use
+  /// [`Self::write_remote`] so terminal control semantics remain exact.
   pub fn write(&self, bytes: &[u8]) {
     let mut converted = Vec::with_capacity(bytes.len());
     let mut prev = 0u8;
@@ -110,9 +114,19 @@ impl Terminal {
       prev = b;
     }
 
+    self.advance(&converted);
+  }
+
+  /// Feed raw bytes from a real PTY/SSH shell into the terminal. This path
+  /// intentionally does not rewrite newlines or any other control bytes.
+  pub fn write_remote(&self, bytes: &[u8]) {
+    self.advance(bytes);
+  }
+
+  fn advance(&self, bytes: &[u8]) {
     let mut term = self.term.lock();
     let mut processor = self.processor.lock();
-    processor.advance(&mut *term, &converted);
+    processor.advance(&mut *term, bytes);
   }
 
   /// Borrow the underlying `Term` for inspection (rendering, tests).
@@ -152,6 +166,22 @@ impl Terminal {
   /// forward bytes to the SSH channel.
   pub fn drain_events(&self) -> Vec<AlacEvent> {
     self.events.try_iter().collect()
+  }
+
+  /// RGB value for a terminal color request. Runtime OSC color overrides
+  /// stored by alacritty win over our static fallback palette.
+  pub fn color_rgb(&self, index: usize) -> alacritty_terminal::vte::ansi::Rgb {
+    self.with_term(|term| {
+      if index < color::COUNT {
+        term.colors()[index].unwrap_or_else(|| crate::colors::color_index_rgb(index))
+      } else {
+        crate::colors::default_foreground_rgb()
+      }
+    })
+  }
+
+  pub fn cursor_blinking(&self) -> bool {
+    self.with_term(|term| term.cursor_style().blinking)
   }
 
   /// Snapshot the visible grid as one `String` per row. Trailing whitespace
@@ -289,6 +319,34 @@ mod tests {
     assert_eq!(cell_at(&t, 0, 0), 'a');
     assert_eq!(cell_at(&t, 0, 1), 'b');
     assert_eq!(cell_at(&t, 1, 0), 'c');
+  }
+
+  #[test]
+  fn remote_write_preserves_pty_line_feed_semantics() {
+    let t = Terminal::new(GridSize::new(24, 80));
+    t.write_remote(b"ab\nc");
+    assert_eq!(cell_at(&t, 0, 0), 'a');
+    assert_eq!(cell_at(&t, 0, 1), 'b');
+    // A raw LF from a PTY advances the row but does not imply carriage
+    // return. The SSH path must preserve that protocol detail.
+    assert_eq!(cell_at(&t, 1, 2), 'c');
+    assert_eq!(cell_at(&t, 1, 0), ' ');
+  }
+
+  #[test]
+  fn device_attributes_sequence_emits_pty_write_event() {
+    use alacritty_terminal::event::Event;
+
+    let t = Terminal::new(GridSize::new(24, 80));
+    t.write_remote(b"\x1b[c");
+
+    let events = t.drain_events();
+    assert!(
+      events
+        .iter()
+        .any(|event| matches!(event, Event::PtyWrite(bytes) if bytes == "\x1b[?6c")),
+      "CSI c should make alacritty request a DA response write, got {events:?}"
+    );
   }
 
   #[test]

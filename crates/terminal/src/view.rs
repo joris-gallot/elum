@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use alacritty_terminal::event::{Event as AlacEvent, WindowSize};
 use gpui::{
   actions, div, px, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
   InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels, Point, Render,
@@ -25,6 +26,8 @@ pub enum TerminalEvent {
   ShellClosed,
   /// The remote rang the bell (received `\x07`)
   Bell,
+  /// The remote changed or reset the terminal title.
+  TitleChanged(Option<String>),
 }
 
 use crate::colors::{default_background, default_foreground};
@@ -123,12 +126,13 @@ impl TerminalView {
         while let Ok(more) = from_remote.try_recv() {
           bytes.extend_from_slice(&more);
         }
-        let term = term.clone();
-        let _ = this.update(cx, move |_, cx| {
-          term.write(&bytes);
-          // Surface alacritty-side events (bell, exit, …)
-          for event in term.drain_events() {
-            dispatch_alac_event(event, cx);
+        let term_for_update = term.clone();
+        let _ = this.update(cx, move |this, cx| {
+          term_for_update.write_remote(&bytes);
+          // Surface alacritty-side events and forward protocol responses
+          // back to the remote shell in the same order alacritty emitted them.
+          for event in term_for_update.drain_events() {
+            this.dispatch_alac_event(event, cx);
           }
           cx.notify();
         });
@@ -529,6 +533,63 @@ impl TerminalView {
       self.last_size = Some(next);
     }
   }
+
+  fn current_window_size(&self) -> WindowSize {
+    let (rows, cols) = self.last_size.unwrap_or((24, 80));
+    let (cell_width, cell_height) = self
+      .last_cell_metrics
+      .map_or((8, 17), |(w, h)| (pixels_to_u16(w), pixels_to_u16(h)));
+
+    WindowSize {
+      num_lines: rows,
+      num_cols: cols,
+      cell_width,
+      cell_height,
+    }
+  }
+
+  fn dispatch_alac_event(&mut self, event: AlacEvent, cx: &mut Context<Self>) {
+    let clipboard_text = if matches!(event, AlacEvent::ClipboardLoad(_, _)) {
+      cx.read_from_clipboard().and_then(|item| item.text())
+    } else {
+      None
+    };
+
+    let effects = alacritty_event_effects(
+      event,
+      self.current_window_size(),
+      clipboard_text.as_deref(),
+      |index| self.terminal.color_rgb(index),
+    );
+
+    for bytes in effects.remote_writes {
+      let _ = self.to_remote.send(bytes);
+    }
+
+    if let Some(text) = effects.clipboard_store {
+      cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    if let Some(title) = effects.title {
+      cx.emit(TerminalEvent::TitleChanged(title));
+    }
+
+    if effects.cursor_blinking_changed {
+      self.cursor_blink_phase = true;
+    }
+
+    if effects.wakeup {
+      cx.notify();
+    }
+
+    if effects.bell {
+      cx.emit(TerminalEvent::Bell);
+    }
+
+    if effects.shell_closed {
+      cx.emit(TerminalEvent::ShellClosed);
+    }
+  }
 }
 
 impl Focusable for TerminalView {
@@ -539,20 +600,79 @@ impl Focusable for TerminalView {
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AlacrittyEventEffects {
+  remote_writes: Vec<Vec<u8>>,
+  clipboard_store: Option<String>,
+  title: Option<Option<String>>,
+  bell: bool,
+  shell_closed: bool,
+  wakeup: bool,
+  cursor_blinking_changed: bool,
+}
+
+fn alacritty_event_effects(
+  event: AlacEvent,
+  window_size: WindowSize,
+  clipboard_text: Option<&str>,
+  mut color_at: impl FnMut(usize) -> alacritty_terminal::vte::ansi::Rgb,
+) -> AlacrittyEventEffects {
+  let mut effects = AlacrittyEventEffects::default();
+
+  match event {
+    AlacEvent::PtyWrite(out) => {
+      effects.remote_writes.push(out.into_bytes());
+    }
+    AlacEvent::TextAreaSizeRequest(format) => {
+      effects.remote_writes.push(format(window_size).into_bytes());
+    }
+    AlacEvent::ColorRequest(index, format) => {
+      effects
+        .remote_writes
+        .push(format(color_at(index)).into_bytes());
+    }
+    AlacEvent::ClipboardStore(_, data) => {
+      effects.clipboard_store = Some(data);
+    }
+    AlacEvent::ClipboardLoad(_, format) => {
+      effects
+        .remote_writes
+        .push(format(clipboard_text.unwrap_or("")).into_bytes());
+    }
+    AlacEvent::Title(title) => {
+      effects.title = Some(Some(title));
+    }
+    AlacEvent::ResetTitle => {
+      effects.title = Some(None);
+    }
+    AlacEvent::CursorBlinkingChange => {
+      effects.cursor_blinking_changed = true;
+    }
+    AlacEvent::Wakeup => {
+      effects.wakeup = true;
+    }
+    AlacEvent::Bell => {
+      effects.bell = true;
+    }
+    AlacEvent::Exit | AlacEvent::ChildExit(_) => {
+      effects.shell_closed = true;
+    }
+    AlacEvent::MouseCursorDirty => {}
+  }
+
+  effects
+}
+
+fn pixels_to_u16(value: Pixels) -> u16 {
+  f32::from(value).round().clamp(0.0, u16::MAX as f32) as u16
+}
+
 /// Word-class predicate for double-click selection. Includes characters
 /// commonly found in identifiers, paths, and URLs so a double-click on
 /// `~/.config/foo.toml` selects the whole token rather than stopping at
 /// each separator.
 fn is_word_char(c: char) -> bool {
   c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~' | ':')
-}
-
-/// Convert an alacritty-side event into a `TerminalEvent` and emit it.
-fn dispatch_alac_event(event: alacritty_terminal::event::Event, cx: &mut Context<TerminalView>) {
-  use alacritty_terminal::event::Event;
-  if matches!(event, Event::Bell) {
-    cx.emit(TerminalEvent::Bell);
-  }
 }
 
 /// Word bounds (inclusive start, exclusive end) of the run containing
@@ -619,6 +739,114 @@ impl Render for TerminalView {
         focused,
         blink_phase,
       ))
+  }
+}
+
+#[cfg(test)]
+mod alacritty_event_tests {
+  use super::*;
+  use std::sync::Arc;
+
+  use alacritty_terminal::term::ClipboardType;
+  use alacritty_terminal::vte::ansi::Rgb;
+
+  fn window_size() -> WindowSize {
+    WindowSize {
+      num_lines: 24,
+      num_cols: 80,
+      cell_width: 8,
+      cell_height: 17,
+    }
+  }
+
+  fn effects(event: AlacEvent, clipboard: Option<&str>) -> AlacrittyEventEffects {
+    alacritty_event_effects(event, window_size(), clipboard, |index| {
+      assert_eq!(index, 1);
+      Rgb { r: 1, g: 2, b: 3 }
+    })
+  }
+
+  #[test]
+  fn pty_write_is_forwarded_to_remote() {
+    let effects = effects(AlacEvent::PtyWrite("abc".into()), None);
+    assert_eq!(effects.remote_writes, vec![b"abc".to_vec()]);
+  }
+
+  #[test]
+  fn text_area_size_request_uses_current_grid_and_cell_size() {
+    let event = AlacEvent::TextAreaSizeRequest(Arc::new(|size| {
+      format!(
+        "{}x{}@{}x{}",
+        size.num_cols, size.num_lines, size.cell_width, size.cell_height
+      )
+    }));
+
+    let effects = effects(event, None);
+    assert_eq!(effects.remote_writes, vec![b"80x24@8x17".to_vec()]);
+  }
+
+  #[test]
+  fn color_request_uses_terminal_color_callback() {
+    let event = AlacEvent::ColorRequest(
+      1,
+      Arc::new(|rgb| format!("rgb:{:02x}{:02x}{:02x}", rgb.r, rgb.g, rgb.b)),
+    );
+
+    let effects = effects(event, None);
+    assert_eq!(effects.remote_writes, vec![b"rgb:010203".to_vec()]);
+  }
+
+  #[test]
+  fn clipboard_load_formats_clipboard_text_for_remote() {
+    let event = AlacEvent::ClipboardLoad(
+      ClipboardType::Clipboard,
+      Arc::new(|text| format!("clip:{text}")),
+    );
+
+    let effects = effects(event, Some("payload"));
+    assert_eq!(effects.remote_writes, vec![b"clip:payload".to_vec()]);
+  }
+
+  #[test]
+  fn clipboard_load_uses_empty_string_when_clipboard_is_missing() {
+    let event = AlacEvent::ClipboardLoad(
+      ClipboardType::Clipboard,
+      Arc::new(|text| format!("clip:{text}")),
+    );
+
+    let effects = effects(event, None);
+    assert_eq!(effects.remote_writes, vec![b"clip:".to_vec()]);
+  }
+
+  #[test]
+  fn clipboard_store_records_text_for_ui_clipboard() {
+    let effects = effects(
+      AlacEvent::ClipboardStore(ClipboardType::Clipboard, "copied".into()),
+      None,
+    );
+    assert_eq!(effects.clipboard_store, Some("copied".into()));
+  }
+
+  #[test]
+  fn title_events_are_preserved() {
+    let titled = effects(AlacEvent::Title("vim".into()), None);
+    assert_eq!(titled.title, Some(Some("vim".into())));
+
+    let reset = effects(AlacEvent::ResetTitle, None);
+    assert_eq!(reset.title, Some(None));
+  }
+
+  #[test]
+  fn bell_and_exit_surface_ui_events() {
+    assert!(effects(AlacEvent::Bell, None).bell);
+    assert!(effects(AlacEvent::Exit, None).shell_closed);
+  }
+
+  #[test]
+  fn wakeup_marks_view_dirty_without_remote_write() {
+    let effects = effects(AlacEvent::Wakeup, None);
+    assert!(effects.wakeup);
+    assert!(effects.remote_writes.is_empty());
   }
 }
 

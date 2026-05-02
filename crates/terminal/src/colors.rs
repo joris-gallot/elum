@@ -21,26 +21,87 @@ pub fn to_rgba(color: AlacColor, default_fg: Rgba, default_bg: Rgba) -> Rgba {
   }
 }
 
-/// Default foreground for the terminal - used when a cell has no explicit fg.
 pub fn default_foreground() -> Rgba {
   rgb(0xe6e6e6)
 }
 
-/// Default background for the terminal - also the window background.
+pub fn default_foreground_rgb() -> Rgb {
+  alac_rgb(0xe6e6e6)
+}
+
 pub fn default_background() -> Rgba {
   rgb(0x101418)
 }
 
-/// The block cursor's background fill. Visible against any cell color.
+pub fn default_background_rgb() -> Rgb {
+  alac_rgb(0x101418)
+}
+
 pub fn cursor_color() -> Rgba {
   rgb(0xe6e6e6)
 }
 
-/// Background color for selected cells. Solid (no alpha blending) - picks
-/// a muted blue that contrasts against the dark theme without being
-/// blinding.
+pub fn cursor_color_rgb() -> Rgb {
+  alac_rgb(0xe6e6e6)
+}
+
 pub fn selection_color() -> Rgba {
   rgb(0x3a4d6a)
+}
+
+/// Fallback RGB palette for terminal color requests. Alacritty stores colors
+/// that escape sequences override; when an app queries a color that has not
+/// been overridden we answer from the same static palette used for rendering.
+pub fn color_index_rgb(index: usize) -> Rgb {
+  match index {
+    0 => alac_rgb(0x1f2329),
+    1 => alac_rgb(0xe06c75),
+    2 => alac_rgb(0x98c379),
+    3 => alac_rgb(0xe5c07b),
+    4 => alac_rgb(0x61afef),
+    5 => alac_rgb(0xc678dd),
+    6 => alac_rgb(0x56b6c2),
+    7 => alac_rgb(0xdcdfe4),
+    8 => alac_rgb(0x4b5263),
+    9 => alac_rgb(0xff7b86),
+    10 => alac_rgb(0xb6e58c),
+    11 => alac_rgb(0xffd58a),
+    12 => alac_rgb(0x7fc4ff),
+    13 => alac_rgb(0xd8a3ec),
+    14 => alac_rgb(0x6cd1de),
+    15 => alac_rgb(0xffffff),
+    16..=231 => {
+      let cube_idx = (index - 16) as u32;
+      Rgb {
+        r: cube_level(cube_idx / 36) as u8,
+        g: cube_level((cube_idx / 6) % 6) as u8,
+        b: cube_level(cube_idx % 6) as u8,
+      }
+    }
+    232..=255 => {
+      let level = 8 + (index - 232) as u8 * 10;
+      Rgb {
+        r: level,
+        g: level,
+        b: level,
+      }
+    }
+    x if x == NamedColor::Foreground as usize || x == NamedColor::BrightForeground as usize => {
+      default_foreground_rgb()
+    }
+    x if x == NamedColor::Background as usize => default_background_rgb(),
+    x if x == NamedColor::Cursor as usize => cursor_color_rgb(),
+    x if x == NamedColor::DimForeground as usize => default_foreground_rgb(),
+    x if x == NamedColor::DimBlack as usize => alac_rgb(0x15181d),
+    x if x == NamedColor::DimRed as usize => alac_rgb(0x9d4c52),
+    x if x == NamedColor::DimGreen as usize => alac_rgb(0x6a8955),
+    x if x == NamedColor::DimYellow as usize => alac_rgb(0xa08956),
+    x if x == NamedColor::DimBlue as usize => alac_rgb(0x447aa7),
+    x if x == NamedColor::DimMagenta as usize => alac_rgb(0x8b549b),
+    x if x == NamedColor::DimCyan as usize => alac_rgb(0x3c7f88),
+    x if x == NamedColor::DimWhite as usize => alac_rgb(0x9a9ca0),
+    _ => default_foreground_rgb(),
+  }
 }
 
 fn named_color(name: NamedColor, fg: Rgba, bg: Rgba) -> Rgba {
@@ -144,6 +205,14 @@ fn rgb(hex: u32) -> Rgba {
     g: ((hex >> 8) & 0xff) as f32 / 255.0,
     b: (hex & 0xff) as f32 / 255.0,
     a: 1.0,
+  }
+}
+
+fn alac_rgb(hex: u32) -> Rgb {
+  Rgb {
+    r: ((hex >> 16) & 0xff) as u8,
+    g: ((hex >> 8) & 0xff) as u8,
+    b: (hex & 0xff) as u8,
   }
 }
 
@@ -291,5 +360,48 @@ mod tests {
     assert!(approx(c.r, 1.0));
     assert!(approx(c.g, 1.0));
     assert!(approx(c.b, 1.0));
+  }
+
+  #[test]
+  fn color_index_rgb_matches_primary_palette() {
+    assert_eq!(color_index_rgb(1), alac_rgb(0xe06c75));
+    assert_eq!(color_index_rgb(4), alac_rgb(0x61afef));
+  }
+
+  #[test]
+  fn color_index_rgb_supports_cube_and_gray_fallbacks() {
+    assert_eq!(color_index_rgb(16), Rgb { r: 0, g: 0, b: 0 });
+    assert_eq!(
+      color_index_rgb(231),
+      Rgb {
+        r: 255,
+        g: 255,
+        b: 255,
+      }
+    );
+    assert_eq!(
+      color_index_rgb(255),
+      Rgb {
+        r: 238,
+        g: 238,
+        b: 238,
+      }
+    );
+  }
+
+  #[test]
+  fn semantic_color_indices_return_defaults() {
+    assert_eq!(
+      color_index_rgb(NamedColor::Foreground as usize),
+      default_foreground_rgb()
+    );
+    assert_eq!(
+      color_index_rgb(NamedColor::Background as usize),
+      default_background_rgb()
+    );
+    assert_eq!(
+      color_index_rgb(NamedColor::Cursor as usize),
+      cursor_color_rgb()
+    );
   }
 }
