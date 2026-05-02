@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use gpui::{
   actions, div, px, ClipboardItem, Context, FocusHandle, Focusable, InteractiveElement,
-  IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-  ParentElement, Pixels, Point, Render, ScrollWheelEvent, Styled, Task, Window,
+  IntoElement, KeyDownEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent, Styled, Task,
+  Window,
 };
 
 // Terminal view editing actions. Keystroke wiring lives in the
@@ -222,13 +222,18 @@ impl TerminalView {
     cx.notify();
   }
 
-  fn handle_mouse_down(
+  /// Pointer pressed inside the terminal area. `pos` is element-local
+  /// (already shifted by the hitbox origin in [`crate::element`]).
+  pub(crate) fn on_pointer_down(
     &mut self,
-    ev: &MouseDownEvent,
-    _window: &mut Window,
+    pos: Point<Pixels>,
+    window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    let cell = self.pixel_to_cell(ev.position);
+    // Make sure keystrokes go to us right after a click, even if focus
+    // was previously elsewhere (e.g. the sidebar).
+    window.focus(&self.focus, cx);
+    let cell = self.pixel_to_cell(pos);
     self.selection = Some(Selection {
       anchor: cell,
       focus: cell,
@@ -237,18 +242,13 @@ impl TerminalView {
     cx.notify();
   }
 
-  fn handle_mouse_move(
-    &mut self,
-    ev: &MouseMoveEvent,
-    _window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
+  pub(crate) fn on_pointer_move(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
     if !self.selection.is_some_and(|s| s.dragging) {
       return;
     }
     // Compute the cell first to release the immutable borrow on `self`
     // before mutating the selection.
-    let cell = self.pixel_to_cell(ev.position);
+    let cell = self.pixel_to_cell(pos);
     if let Some(sel) = self.selection.as_mut() {
       if cell != sel.focus {
         sel.focus = cell;
@@ -257,7 +257,7 @@ impl TerminalView {
     }
   }
 
-  fn handle_mouse_up(&mut self, _ev: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+  pub(crate) fn on_pointer_up(&mut self, _cx: &mut Context<Self>) {
     if let Some(sel) = self.selection.as_mut() {
       sel.dragging = false;
       // If the user merely clicked (no drag), the anchor and focus
@@ -269,12 +269,13 @@ impl TerminalView {
     }
   }
 
-  /// Convert a window-local point to a (row, col) display cell using the
-  /// approximate constants. Off-by-a-fraction-of-a-cell at the far edge,
-  /// negligible in practice; the element's real metrics paint correctly.
+  /// Convert an element-local point (origin at the hitbox top-left, i.e.
+  /// the cell grid origin) to a `(row, col)` display cell. The element
+  /// uses real font metrics for paint, so a small mismatch with these
+  /// approximate constants just rounds rows/cols.
   fn pixel_to_cell(&self, pos: Point<Pixels>) -> (usize, usize) {
-    let x = (f32::from(pos.x) - PADDING).max(0.0);
-    let y = (f32::from(pos.y) - PADDING).max(0.0);
+    let x = f32::from(pos.x).max(0.0);
+    let y = f32::from(pos.y).max(0.0);
     let line_h = FONT_SIZE * LINE_HEIGHT_RATIO;
     let col = (x / APPROX_CELL_WIDTH) as usize;
     let row = (y / line_h) as usize;
@@ -378,16 +379,17 @@ impl Render for TerminalView {
       .on_action(cx.listener(Self::on_select_all))
       .on_key_down(cx.listener(Self::handle_key_down))
       .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
-      .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
-      .on_mouse_move(cx.listener(Self::handle_mouse_move))
-      .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
       .size_full()
       .bg(default_background())
       .text_color(default_foreground())
       .font_family(FONT_FAMILY)
       .text_size(px(FONT_SIZE))
       .p(px(PADDING))
-      .child(TerminalElement::new(self.terminal.clone(), self.selection))
+      .child(TerminalElement::new(
+        self.terminal.clone(),
+        self.selection,
+        cx.entity().downgrade(),
+      ))
   }
 }
 

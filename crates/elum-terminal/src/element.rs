@@ -20,15 +20,16 @@
 use std::sync::Arc;
 
 use gpui::{
-  fill, point, px, relative, size, App, Bounds, Element, ElementId, FontStyle, FontWeight,
-  GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, Pixels, Point, Rgba,
-  SharedString, Size, Style, TextAlign, TextRun, TextStyle, UnderlineStyle, Window,
+  fill, point, px, relative, size, App, Bounds, DispatchPhase, Element, ElementId, FontStyle,
+  FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement,
+  LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba,
+  SharedString, Size, Style, TextAlign, TextRun, TextStyle, UnderlineStyle, WeakEntity, Window,
 };
 
 use crate::colors::{
   cursor_color, default_background, default_foreground, selection_color, to_rgba,
 };
-use crate::view::Selection;
+use crate::view::{Selection, TerminalView};
 use crate::{CellSnapshot, GridSnapshot, Terminal};
 
 /// Vertical multiplier on font size to derive line height.
@@ -37,13 +38,19 @@ const LINE_HEIGHT_RATIO: f32 = 1.3;
 pub struct TerminalElement {
   terminal: Arc<Terminal>,
   selection: Option<Selection>,
+  view: WeakEntity<TerminalView>,
 }
 
 impl TerminalElement {
-  pub fn new(terminal: Arc<Terminal>, selection: Option<Selection>) -> Self {
+  pub fn new(
+    terminal: Arc<Terminal>,
+    selection: Option<Selection>,
+    view: WeakEntity<TerminalView>,
+  ) -> Self {
     Self {
       terminal,
       selection,
+      view,
     }
   }
 }
@@ -55,6 +62,7 @@ pub struct Prepaint {
   font_size: Pixels,
   text_style: TextStyle,
   origin: Point<Pixels>,
+  hitbox: Hitbox,
 }
 
 impl IntoElement for TerminalElement {
@@ -116,6 +124,7 @@ impl Element for TerminalElement {
       .map_or_else(|_| px(f32::from(font_size) * 0.6), |adv| adv.width);
 
     let snapshot = self.terminal.snapshot_grid();
+    let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
     Prepaint {
       snapshot,
@@ -124,6 +133,7 @@ impl Element for TerminalElement {
       font_size,
       text_style,
       origin: bounds.origin,
+      hitbox,
     }
   }
 
@@ -191,6 +201,56 @@ impl Element for TerminalElement {
         cx,
       );
     }
+
+    self.register_mouse_listeners(prepaint.hitbox.clone(), window);
+  }
+}
+
+impl TerminalElement {
+  /// Register window-level mouse listeners for the next frame, dispatching
+  /// element-local positions back into the [`TerminalView`]. Done here
+  /// rather than on a wrapper div so we can subtract the hitbox origin
+  /// and so the dispatcher respects z-order (overlays above the terminal
+  /// will not see clicks reach us).
+  fn register_mouse_listeners(&self, hitbox: Hitbox, window: &mut Window) {
+    let down_view = self.view.clone();
+    let down_hitbox = hitbox.clone();
+    window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+      if phase != DispatchPhase::Bubble || e.button != MouseButton::Left {
+        return;
+      }
+      if !down_hitbox.is_hovered(window) {
+        return;
+      }
+      let local = e.position - down_hitbox.bounds.origin;
+      let _ = down_view.update(cx, |view, cx| {
+        view.on_pointer_down(local, window, cx);
+      });
+    });
+
+    let move_view = self.view.clone();
+    let move_hitbox = hitbox;
+    window.on_mouse_event(move |e: &MouseMoveEvent, phase, _window, cx| {
+      if phase != DispatchPhase::Bubble {
+        return;
+      }
+      // Drag continues even if the cursor leaves the hitbox. The view
+      // itself decides whether to act based on `selection.dragging`.
+      let local = e.position - move_hitbox.bounds.origin;
+      let _ = move_view.update(cx, |view, cx| {
+        view.on_pointer_move(local, cx);
+      });
+    });
+
+    let up_view = self.view.clone();
+    window.on_mouse_event(move |e: &MouseUpEvent, phase, _window, cx| {
+      if phase != DispatchPhase::Bubble || e.button != MouseButton::Left {
+        return;
+      }
+      let _ = up_view.update(cx, |view, cx| {
+        view.on_pointer_up(cx);
+      });
+    });
   }
 }
 
