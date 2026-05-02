@@ -9,8 +9,9 @@
 //!     docker compose -f docker/sshd/compose.yml down
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use ssh::{AuthMethod, ConnectConfig, Session};
+use ssh::{AlwaysAccept, AuthMethod, ConnectConfig, Session};
 
 /// Path to the test private key, relative to this crate's manifest dir.
 fn test_key_path() -> PathBuf {
@@ -33,6 +34,7 @@ fn test_config() -> ConnectConfig {
       key_path: test_key_path(),
       passphrase: None,
     },
+    Arc::new(AlwaysAccept),
   )
 }
 

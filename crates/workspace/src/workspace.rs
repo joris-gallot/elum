@@ -5,7 +5,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
   actions, div, px, relative, Action, AnyElement, App, AppContext, Context, Entity, FocusHandle,
   Focusable, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled,
-  Subscription, Window,
+  Subscription, Task, Window,
 };
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_component::dialog::DialogButtonProps;
@@ -13,8 +13,13 @@ use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
 use gpui_component::tab::{Tab as ComponentTab, TabBar};
 use gpui_component::{ActiveTheme, Sizable, StyledExt, TitleBar, WindowExt as _};
+
+use async_trait::async_trait;
 use serde::Deserialize;
-use ssh::{AuthMethod, ConnectConfig, Session, ShellHandle};
+use ssh::{
+  AuthMethod, ConnectConfig, HostKeyInfo, HostKeyPolicy, HostKeyStatus, HostKeyVerdict, Session,
+  ShellHandle,
+};
 use terminal::view::{TerminalEvent, TerminalView};
 use terminal::{GridSize, Terminal};
 use tokio::runtime::Runtime;
@@ -22,6 +27,7 @@ use tokio::runtime::Runtime;
 use crate::host_book::{Host, HostAuth, HostBook};
 use crate::keychain;
 use ui::add_host_dialog::{self, NewAuth, NewHostInput};
+use ui::host_key_dialog::{self, HostKeyDialogInfo, HostKeyDialogKind, HostKeyDialogVerdict};
 use ui::secret_prompt::{self, SecretPrompt};
 use ui::UiIconName;
 
@@ -67,6 +73,44 @@ pub struct Workspace {
   runtime: Arc<Runtime>,
   next_tab_id: u64,
   focus: FocusHandle,
+  /// Producer side of the host-key-prompt pipeline. Each `ConnectConfig`
+  /// gets a `WorkspaceHostKeyPolicy` cloned from this sender; the policy
+  /// posts a request and waits for the dialog's verdict.
+  host_key_requests: flume::Sender<HostKeyRequest>,
+  /// Long-running task that drains `host_key_requests`, opens the dialog
+  /// for each, and forwards the verdict back through the request's
+  /// reply channel. Held here so it stays alive as long as the workspace.
+  _host_key_loop: Task<()>,
+}
+
+struct HostKeyRequest {
+  info: HostKeyInfo,
+  reply: flume::Sender<HostKeyVerdict>,
+}
+
+struct WorkspaceHostKeyPolicy {
+  requests: flume::Sender<HostKeyRequest>,
+}
+
+#[async_trait]
+impl HostKeyPolicy for WorkspaceHostKeyPolicy {
+  async fn verify(&self, info: HostKeyInfo) -> HostKeyVerdict {
+    let (reply_tx, reply_rx) = flume::bounded(1);
+    if self
+      .requests
+      .send(HostKeyRequest {
+        info,
+        reply: reply_tx,
+      })
+      .is_err()
+    {
+      return HostKeyVerdict::Reject;
+    }
+    reply_rx
+      .recv_async()
+      .await
+      .unwrap_or(HostKeyVerdict::Reject)
+  }
 }
 
 struct Tab {
@@ -100,6 +144,36 @@ impl Workspace {
     // the user has clicked anything. When a tab becomes active we hand
     // focus down to its TerminalView.
     window.focus(&focus, cx);
+
+    let (host_key_requests, host_key_rx) = flume::unbounded::<HostKeyRequest>();
+    let host_key_loop = cx.spawn_in(window, async move |this, cx| {
+      while let Ok(request) = host_key_rx.recv_async().await {
+        let _ = this.update_in(cx, |_, window, cx| {
+          let dialog_info = HostKeyDialogInfo {
+            host: request.info.host,
+            port: request.info.port,
+            kind: match request.info.status {
+              HostKeyStatus::New => HostKeyDialogKind::New,
+              HostKeyStatus::Changed { previous_line } => {
+                HostKeyDialogKind::Changed { previous_line }
+              }
+            },
+            key_algorithm: request.info.key_algorithm,
+            fingerprint: request.info.fingerprint,
+          };
+          let reply = request.reply;
+          host_key_dialog::open(window, cx, dialog_info, move |verdict, _, _| {
+            let v = match verdict {
+              HostKeyDialogVerdict::AcceptOnce => HostKeyVerdict::AcceptOnce,
+              HostKeyDialogVerdict::AcceptAndRemember => HostKeyVerdict::AcceptAndRemember,
+              HostKeyDialogVerdict::Reject => HostKeyVerdict::Reject,
+            };
+            let _ = reply.send(v);
+          });
+        });
+      }
+    });
+
     Self {
       host_book,
       tabs: Vec::new(),
@@ -107,6 +181,8 @@ impl Workspace {
       runtime,
       next_tab_id: 1,
       focus,
+      host_key_requests,
+      _host_key_loop: host_key_loop,
     }
   }
 
@@ -232,6 +308,9 @@ impl Workspace {
     cx: &mut Context<Self>,
   ) {
     let runtime = self.runtime.clone();
+    let host_key_policy = Arc::new(WorkspaceHostKeyPolicy {
+      requests: self.host_key_requests.clone(),
+    });
     cx.spawn_in(window, async move |this, cx| {
       let host_for_task = host.clone();
       let auth_for_task = auth.clone();
@@ -241,6 +320,7 @@ impl Workspace {
           host_for_task.port,
           &host_for_task.user,
           auth_for_task,
+          host_key_policy,
         );
         let session = Session::connect(&cfg).await?;
         let shell = session.open_shell(INITIAL_COLS, INITIAL_ROWS).await?;

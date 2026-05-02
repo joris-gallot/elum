@@ -6975,8 +6975,11 @@ name = "ssh"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "dirs 5.0.1",
  "flume",
  "russh",
+ "tempfile",
  "tokio",
 ]
 
@@ -9332,7 +9335,9 @@ name = "workspace"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dirs 5.0.1",
+ "flume",
  "gpui",
  "gpui-component",
  "keyring",

@@ -1,34 +1,156 @@
 //! SSH transport for Elum.
 //!
 //! Owns a tokio runtime that drives `russh`. Exposes a small async API:
-//! connect, exec, close. Future surface (out of scope for this spike):
-//! interactive shell channels for the terminal, port forwarding, SFTP.
-//!
-//! No host-key verification policy yet, `accept_any_host_key` is hard-wired
-//! to `true` in tests. Real builds will gate this on a `KnownHosts` store.
+//! connect, exec, close. Host-key verification is delegated to a caller provided
+//! [`HostKeyPolicy`] so the UI can ask the user when a key is new or has changed
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context as _, Result};
+use async_trait::async_trait;
 use russh::client::{self, Handle};
-use russh::keys::{load_secret_key, ssh_key, PrivateKeyWithHashAlg};
+use russh::keys::known_hosts::{check_known_hosts_path, learn_known_hosts_path};
+use russh::keys::{load_secret_key, ssh_key, Error as KeysError, HashAlg, PrivateKeyWithHashAlg};
 use russh::{ChannelMsg, Disconnect};
 
-/// What a Russh client implements to react to server events. We only need
-/// the host-key check; everything else uses defaults.
+/// Outcome of consulting `known_hosts` for the current connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostKeyStatus {
+  /// `host:port` is not present in `known_hosts`
+  New,
+  /// `host:port` is present but the key advertised now differs from the one recorded earlier
+  Changed { previous_line: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostKeyVerdict {
+  /// Connect this once, do not record the key.
+  AcceptOnce,
+  /// Connect and remember (writes / replaces the entry in `known_hosts`).
+  AcceptAndRemember,
+  /// Refuse the connection.
+  Reject,
+}
+
+/// Information passed to the policy when prompting the user
+#[derive(Debug, Clone)]
+pub struct HostKeyInfo {
+  pub host: String,
+  pub port: u16,
+  pub status: HostKeyStatus,
+  pub key_algorithm: String,
+  pub fingerprint: String,
+}
+
+#[async_trait]
+pub trait HostKeyPolicy: Send + Sync {
+  async fn verify(&self, info: HostKeyInfo) -> HostKeyVerdict;
+}
+
+/// Test/CLI fixture that auto-accepts every host key without prompting.
+/// Never use in production code paths.
+pub struct AlwaysAccept;
+
+#[async_trait]
+impl HostKeyPolicy for AlwaysAccept {
+  async fn verify(&self, _info: HostKeyInfo) -> HostKeyVerdict {
+    HostKeyVerdict::AcceptOnce
+  }
+}
+
+/// Bridges russh's `client::Handler` to our `HostKeyPolicy`. Stores the
+/// connection coordinates so `check_server_key` can consult `known_hosts`
+/// with the right `host:port`.
 struct ClientHandler {
-  accept_any_host_key: bool,
+  host: String,
+  port: u16,
+  policy: Arc<dyn HostKeyPolicy>,
+  known_hosts_path: PathBuf,
 }
 
 impl client::Handler for ClientHandler {
-  type Error = russh::Error;
+  type Error = anyhow::Error;
 
   async fn check_server_key(
     &mut self,
-    _server_public_key: &ssh_key::PublicKey,
+    server_public_key: &ssh_key::PublicKey,
   ) -> Result<bool, Self::Error> {
-    Ok(self.accept_any_host_key)
+    let status = match check_known_hosts_path(
+      &self.host,
+      self.port,
+      server_public_key,
+      &self.known_hosts_path,
+    ) {
+      Ok(true) => return Ok(true),
+      Ok(false) => HostKeyStatus::New,
+      Err(KeysError::KeyChanged { line }) => HostKeyStatus::Changed {
+        previous_line: line,
+      },
+      Err(e) => return Err(anyhow!("known_hosts check failed: {e}")),
+    };
+
+    let info = HostKeyInfo {
+      host: self.host.clone(),
+      port: self.port,
+      status,
+      key_algorithm: server_public_key.algorithm().to_string(),
+      fingerprint: server_public_key.fingerprint(HashAlg::Sha256).to_string(),
+    };
+
+    let verdict = self.policy.verify(info).await;
+    match verdict {
+      HostKeyVerdict::Reject => Ok(false),
+      HostKeyVerdict::AcceptOnce => Ok(true),
+      HostKeyVerdict::AcceptAndRemember => {
+        if let HostKeyStatus::Changed { previous_line } = status {
+          remove_known_hosts_line(&self.known_hosts_path, previous_line).with_context(|| {
+            format!(
+              "removing stale entry from {}",
+              self.known_hosts_path.display()
+            )
+          })?;
+        }
+        learn_known_hosts_path(
+          &self.host,
+          self.port,
+          server_public_key,
+          &self.known_hosts_path,
+        )
+        .with_context(|| format!("writing {}", self.known_hosts_path.display()))?;
+        Ok(true)
+      }
+    }
   }
+}
+
+/// Resolve the user's `~/.ssh/known_hosts`
+/// Falls back to the current directory if no home dir can be found
+pub fn default_known_hosts_path() -> PathBuf {
+  dirs::home_dir()
+    .unwrap_or_else(|| PathBuf::from("."))
+    .join(".ssh")
+    .join("known_hosts")
+}
+
+/// Delete a single line (1-based, matching what russh reports in
+/// [`HostKeyStatus::Changed`]) from `known_hosts`
+/// No-op if the file doesn't exist or the line is out of range.
+fn remove_known_hosts_line(path: &Path, line_1based: usize) -> std::io::Result<()> {
+  if !path.exists() {
+    return Ok(());
+  }
+  let contents = std::fs::read_to_string(path)?;
+  let mut lines: Vec<&str> = contents.lines().collect();
+  if line_1based == 0 || line_1based > lines.len() {
+    return Ok(());
+  }
+  lines.remove(line_1based - 1);
+  let mut out = lines.join("\n");
+  if !out.is_empty() {
+    out.push('\n');
+  }
+  std::fs::write(path, out)
 }
 
 #[derive(Debug, Clone)]
@@ -42,15 +164,18 @@ pub enum AuthMethod {
   },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConnectConfig {
   pub host: String,
   pub port: u16,
   pub user: String,
   pub auth: AuthMethod,
-  /// Skip host-key validation. Currently always true while we don't have a
-  /// known_hosts store; flagged so callers can flip it once we do.
-  pub accept_any_host_key: bool,
+  /// Decides what to do when the server's key isn't already trusted.
+  pub host_key_policy: Arc<dyn HostKeyPolicy>,
+  /// Path to the `known_hosts` file. Defaults to `~/.ssh/known_hosts` so
+  /// trust decisions interop with the system `ssh` CLI; tests override
+  /// it to a temp file.
+  pub known_hosts_path: PathBuf,
 }
 
 impl ConnectConfig {
@@ -59,13 +184,15 @@ impl ConnectConfig {
     port: u16,
     user: impl Into<String>,
     auth: AuthMethod,
+    host_key_policy: Arc<dyn HostKeyPolicy>,
   ) -> Self {
     Self {
       host: host.into(),
       port,
       user: user.into(),
       auth,
-      accept_any_host_key: true,
+      host_key_policy,
+      known_hosts_path: default_known_hosts_path(),
     }
   }
 }
@@ -89,7 +216,10 @@ impl Session {
   pub async fn connect(cfg: &ConnectConfig) -> Result<Self> {
     let config = Arc::new(client::Config::default());
     let handler = ClientHandler {
-      accept_any_host_key: cfg.accept_any_host_key,
+      host: cfg.host.clone(),
+      port: cfg.port,
+      policy: cfg.host_key_policy.clone(),
+      known_hosts_path: cfg.known_hosts_path.clone(),
     };
 
     let mut handle = client::connect(config, (cfg.host.as_str(), cfg.port), handler)
@@ -298,5 +428,175 @@ impl Drop for ShellHandle {
     if let Some(task) = self.task.take() {
       task.abort();
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use russh::client::Handler as _;
+  use ssh_key::PublicKey;
+  use std::sync::atomic::{AtomicUsize, Ordering};
+  use std::sync::Mutex;
+  use tempfile::TempDir;
+
+  // Test keys have no OpenSSH comment because russh's `check_known_hosts`
+  // re-parses the file via `parse_public_key_base64`, which never sets a
+  // comment, and `PublicKey`'s derived `PartialEq` compares the comment
+  // field. Keys presented by an actual server over the wire also carry
+  // no comment, so this is faithful to production.
+  const KEY_A: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFpA9qS29zSWIfEGh5E5CnHzVpQPnSQq5fOuRWE6tLeu";
+  const KEY_B: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGKtk3wKgiNr8wO+06/gnHBkDgtTYUyw3h3JAPwwzhzf";
+
+  fn pubkey(s: &str) -> PublicKey {
+    PublicKey::from_openssh(s).expect("parse test key")
+  }
+
+  /// Tracks calls and returns a fixed verdict so tests pin behavior
+  /// without spinning a UI dialog.
+  struct StubPolicy {
+    verdict: HostKeyVerdict,
+    seen_status: Arc<Mutex<Option<HostKeyStatus>>>,
+    calls: Arc<AtomicUsize>,
+  }
+
+  impl StubPolicy {
+    fn new(
+      verdict: HostKeyVerdict,
+    ) -> (
+      Arc<Self>,
+      Arc<Mutex<Option<HostKeyStatus>>>,
+      Arc<AtomicUsize>,
+    ) {
+      let seen = Arc::new(Mutex::new(None));
+      let calls = Arc::new(AtomicUsize::new(0));
+      let policy = Arc::new(Self {
+        verdict,
+        seen_status: seen.clone(),
+        calls: calls.clone(),
+      });
+      (policy, seen, calls)
+    }
+  }
+
+  #[async_trait]
+  impl HostKeyPolicy for StubPolicy {
+    async fn verify(&self, info: HostKeyInfo) -> HostKeyVerdict {
+      *self.seen_status.lock().unwrap() = Some(info.status);
+      self.calls.fetch_add(1, Ordering::SeqCst);
+      self.verdict
+    }
+  }
+
+  fn handler_at(path: PathBuf, policy: Arc<dyn HostKeyPolicy>) -> ClientHandler {
+    ClientHandler {
+      host: "test-host".into(),
+      port: 22,
+      policy,
+      known_hosts_path: path,
+    }
+  }
+
+  #[tokio::test]
+  async fn missing_known_hosts_treats_host_as_new_and_consults_policy() {
+    let dir = TempDir::new().unwrap();
+    let (policy, seen, calls) = StubPolicy::new(HostKeyVerdict::AcceptOnce);
+    let mut handler = handler_at(dir.path().join("known_hosts"), policy);
+
+    let accepted = handler.check_server_key(&pubkey(KEY_A)).await.unwrap();
+    assert!(accepted);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(*seen.lock().unwrap(), Some(HostKeyStatus::New));
+  }
+
+  #[tokio::test]
+  async fn matching_recorded_key_skips_policy_entirely() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("known_hosts");
+    learn_known_hosts_path("test-host", 22, &pubkey(KEY_A), &path).unwrap();
+
+    let (policy, _, calls) = StubPolicy::new(HostKeyVerdict::Reject);
+    let mut handler = handler_at(path, policy);
+
+    assert!(handler.check_server_key(&pubkey(KEY_A)).await.unwrap());
+    assert_eq!(
+      calls.load(Ordering::SeqCst),
+      0,
+      "policy must not be consulted for an already-trusted key"
+    );
+  }
+
+  #[tokio::test]
+  async fn changed_key_is_reported_to_policy() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("known_hosts");
+    learn_known_hosts_path("test-host", 22, &pubkey(KEY_A), &path).unwrap();
+
+    let (policy, seen, _) = StubPolicy::new(HostKeyVerdict::Reject);
+    let mut handler = handler_at(path, policy);
+
+    let accepted = handler.check_server_key(&pubkey(KEY_B)).await.unwrap();
+    assert!(!accepted, "Reject must close the connection");
+    assert!(matches!(
+      *seen.lock().unwrap(),
+      Some(HostKeyStatus::Changed { .. })
+    ));
+  }
+
+  #[tokio::test]
+  async fn accept_and_remember_writes_new_host_to_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("known_hosts");
+    let (policy, _, _) = StubPolicy::new(HostKeyVerdict::AcceptAndRemember);
+    let mut handler = handler_at(path.clone(), policy);
+
+    handler.check_server_key(&pubkey(KEY_A)).await.unwrap();
+
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(contents.contains("test-host"));
+    assert!(
+      contents.contains("AAAAC3NzaC1lZDI1NTE5AAAAIFpA9qS29zSWIfEGh5E5CnHzVpQPnSQq5fOuRWE6tLeu")
+    );
+  }
+
+  #[tokio::test]
+  async fn accept_and_remember_replaces_changed_entry() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("known_hosts");
+    learn_known_hosts_path("test-host", 22, &pubkey(KEY_A), &path).unwrap();
+
+    let (policy, _, _) = StubPolicy::new(HostKeyVerdict::AcceptAndRemember);
+    let mut handler = handler_at(path.clone(), policy);
+
+    handler.check_server_key(&pubkey(KEY_B)).await.unwrap();
+
+    let contents = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 1, "stale entry should be removed");
+    assert!(
+      contents.contains("AAAAC3NzaC1lZDI1NTE5AAAAIGKtk3wKgiNr8wO+06/gnHBkDgtTYUyw3h3JAPwwzhzf")
+    );
+  }
+
+  #[test]
+  fn remove_known_hosts_line_drops_target_only() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("known_hosts");
+    std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+
+    remove_known_hosts_line(&path, 2).unwrap();
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\ngamma\n");
+  }
+
+  #[test]
+  fn remove_known_hosts_line_out_of_range_is_a_noop() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("known_hosts");
+    std::fs::write(&path, "only\n").unwrap();
+    remove_known_hosts_line(&path, 99).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "only\n");
   }
 }

@@ -6,7 +6,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ssh::{AuthMethod, ConnectConfig, Session};
+use std::sync::Arc;
+
+use ssh::{AlwaysAccept, AuthMethod, ConnectConfig, Session};
 use tokio::time::timeout;
 
 fn test_key_path() -> PathBuf {
@@ -29,6 +31,7 @@ fn test_config() -> ConnectConfig {
       key_path: test_key_path(),
       passphrase: None,
     },
+    Arc::new(AlwaysAccept),
   )
 }
 
