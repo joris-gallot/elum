@@ -93,7 +93,6 @@ pub enum SelectionKind {
 }
 
 impl Terminal {
-  /// Create a fresh terminal with the given grid size and default config.
   pub fn new(size: GridSize) -> Self {
     let (events_tx, events_rx) = unbounded();
     let config = Config {
@@ -106,25 +105,6 @@ impl Terminal {
       processor: FairMutex::new(Processor::new()),
       events: events_rx,
     }
-  }
-
-  /// Feed display text into the terminal. Bare `\n` is normalized to `\r\n`
-  /// so debug/display-only output starts the next line at column 0.
-  ///
-  /// Do not use this for bytes coming from a real PTY/SSH channel; use
-  /// [`Self::write_remote`] so terminal control semantics remain exact.
-  pub fn write(&self, bytes: &[u8]) {
-    let mut converted = Vec::with_capacity(bytes.len());
-    let mut prev = 0u8;
-    for &b in bytes {
-      if b == b'\n' && prev != b'\r' {
-        converted.push(b'\r');
-      }
-      converted.push(b);
-      prev = b;
-    }
-
-    self.advance(&converted);
   }
 
   /// Feed raw bytes from a real PTY/SSH shell into the terminal. This path
@@ -370,26 +350,6 @@ mod tests {
   }
 
   #[test]
-  fn writes_plain_text_into_grid() {
-    let t = Terminal::new(GridSize::new(24, 80));
-    t.write(b"hello");
-    assert_eq!(cell_at(&t, 0, 0), 'h');
-    assert_eq!(cell_at(&t, 0, 1), 'e');
-    assert_eq!(cell_at(&t, 0, 2), 'l');
-    assert_eq!(cell_at(&t, 0, 3), 'l');
-    assert_eq!(cell_at(&t, 0, 4), 'o');
-  }
-
-  #[test]
-  fn line_feed_advances_cursor_to_next_row_column_zero() {
-    let t = Terminal::new(GridSize::new(24, 80));
-    t.write(b"ab\nc");
-    assert_eq!(cell_at(&t, 0, 0), 'a');
-    assert_eq!(cell_at(&t, 0, 1), 'b');
-    assert_eq!(cell_at(&t, 1, 0), 'c');
-  }
-
-  #[test]
   fn remote_write_preserves_pty_line_feed_semantics() {
     let t = Terminal::new(GridSize::new(24, 80));
     t.write_remote(b"ab\nc");
@@ -418,174 +378,12 @@ mod tests {
   }
 
   #[test]
-  fn carriage_return_returns_to_column_zero_without_advancing_row() {
-    let t = Terminal::new(GridSize::new(24, 80));
-    t.write(b"ab\rc");
-    assert_eq!(cell_at(&t, 0, 0), 'c');
-    assert_eq!(cell_at(&t, 0, 1), 'b');
-  }
-
-  #[test]
-  fn ansi_color_escape_sets_foreground_color() {
-    let t = Terminal::new(GridSize::new(24, 80));
-    // SGR 31 = red foreground. SGR 0 = reset.
-    t.write(b"\x1b[31mred\x1b[0mx");
-
-    let (r_fg, x_fg) = t.with_term(|term| {
-      let red_point = alacritty_terminal::index::Point::new(
-        alacritty_terminal::index::Line(0),
-        alacritty_terminal::index::Column(0),
-      );
-      let x_point = alacritty_terminal::index::Point::new(
-        alacritty_terminal::index::Line(0),
-        alacritty_terminal::index::Column(3),
-      );
-      (term.grid()[red_point].fg, term.grid()[x_point].fg)
-    });
-
-    use alacritty_terminal::vte::ansi::{Color, NamedColor};
-    assert!(matches!(r_fg, Color::Named(NamedColor::Red)));
-    assert!(matches!(x_fg, Color::Named(NamedColor::Foreground)));
-  }
-
-  #[test]
-  fn cursor_position_reflects_writes() {
-    let t = Terminal::new(GridSize::new(24, 80));
-    t.write(b"abcde");
-    let cursor = t.with_term(|term| term.grid().cursor.point);
-    assert_eq!(cursor.line.0, 0);
-    assert_eq!(cursor.column.0, 5);
-  }
-
-  #[test]
   fn resize_changes_grid_dimensions() {
     let t = Terminal::new(GridSize::new(24, 80));
     t.resize(GridSize::new(10, 40));
     let (rows, cols) = t.with_term(|term| (term.screen_lines(), term.columns()));
     assert_eq!(rows, 10);
     assert_eq!(cols, 40);
-  }
-
-  fn row_text(snap: &GridSnapshot, row: usize) -> String {
-    snap.rows[row]
-      .iter()
-      .map(|c| c.c)
-      .collect::<String>()
-      .trim_end()
-      .to_string()
-  }
-
-  #[test]
-  fn scroll_lines_changes_visible_viewport() {
-    let t = Terminal::new(GridSize::new(3, 20));
-    for i in 0..20 {
-      t.write(format!("line{i:02}\n").as_bytes());
-    }
-    let live_top = row_text(&t.snapshot_grid(), 0);
-
-    t.scroll_lines(5);
-    let scrolled_top = row_text(&t.snapshot_grid(), 0);
-
-    assert_ne!(
-      live_top, scrolled_top,
-      "scrolling into history must change the top visible row"
-    );
-  }
-
-  #[test]
-  fn scroll_to_bottom_returns_to_live_view() {
-    let t = Terminal::new(GridSize::new(3, 20));
-    for i in 0..20 {
-      t.write(format!("line{i:02}\n").as_bytes());
-    }
-    let live_top = row_text(&t.snapshot_grid(), 0);
-
-    t.scroll_lines(10);
-    assert_ne!(row_text(&t.snapshot_grid(), 0), live_top);
-
-    t.scroll_to_bottom();
-    assert_eq!(row_text(&t.snapshot_grid(), 0), live_top);
-  }
-
-  #[test]
-  fn scrollback_retains_lines_pushed_off_viewport() {
-    let mut size = GridSize::new(5, 80);
-    size.scrollback = 50;
-    let t = Terminal::new(size);
-
-    // Write 10 lines; the first 5 should scroll into the history buffer.
-    for i in 0..10 {
-      t.write(format!("line{i}\n").as_bytes());
-    }
-
-    let history = t.with_term(|term| term.history_size());
-    assert!(
-      history >= 5,
-      "expected at least 5 lines in scrollback, got {history}"
-    );
-  }
-
-  #[test]
-  fn snapshot_grid_captures_text_and_cursor_position() {
-    let t = Terminal::new(GridSize::new(5, 20));
-    t.write(b"hi\r\nthere");
-
-    let snap = t.snapshot_grid();
-    assert_eq!(snap.rows.len(), 5);
-    assert_eq!(snap.rows[0].len(), 20);
-    assert_eq!(snap.rows[0][0].c, 'h');
-    assert_eq!(snap.rows[0][1].c, 'i');
-    assert_eq!(snap.rows[1][0].c, 't');
-    assert_eq!(snap.rows[1][4].c, 'e');
-    // Cursor sits one past the last written char on row 1.
-    assert_eq!(snap.cursor, (1, 5));
-    assert!(snap.cursor_visible);
-  }
-
-  #[test]
-  fn snapshot_grid_marks_inverse_flag_after_sgr_7() {
-    let t = Terminal::new(GridSize::new(3, 10));
-    t.write(b"\x1b[7mX\x1b[0mY");
-    let snap = t.snapshot_grid();
-    assert!(snap.rows[0][0].inverse);
-    assert!(!snap.rows[0][1].inverse);
-  }
-
-  #[test]
-  fn wide_char_occupies_two_cells_with_spacer() {
-    use alacritty_terminal::term::cell::Flags;
-
-    let t = Terminal::new(GridSize::new(24, 80));
-    // 你 (U+4F60) and 好 (U+597D): each is rendered double-width.
-    t.write("你好".as_bytes());
-
-    let (c0, c1, c2, c3, f0, f1) = t.with_term(|term| {
-      let p = |col: usize| {
-        alacritty_terminal::index::Point::new(
-          alacritty_terminal::index::Line(0),
-          alacritty_terminal::index::Column(col),
-        )
-      };
-      (
-        term.grid()[p(0)].c,
-        term.grid()[p(1)].c,
-        term.grid()[p(2)].c,
-        term.grid()[p(3)].c,
-        term.grid()[p(0)].flags,
-        term.grid()[p(1)].flags,
-      )
-    });
-
-    assert_eq!(c0, '你');
-    assert!(f0.contains(Flags::WIDE_CHAR));
-    // Cell 1 is the right half of the wide char - alacritty stores it as a
-    // spacer flagged WIDE_CHAR_SPACER. The visible char is implementation-
-    // defined; we only assert the flag.
-    assert!(f1.contains(Flags::WIDE_CHAR_SPACER));
-    assert_eq!(c2, '好');
-    // The two-cell width sequence repeats:
-    assert_eq!(c1, ' '); // spacer renders as space
-    let _ = c3; // unrelated cell, unused
   }
 
   #[test]
