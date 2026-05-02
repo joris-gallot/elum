@@ -37,7 +37,7 @@ use crate::mouse::{
   alt_scroll, mouse_button_report, mouse_move_report, mouse_reporting_enabled, scroll_report,
   MouseCell, ScrollDirection,
 };
-use crate::{GridSize, Terminal};
+use crate::{GridSize, SelectionKind, Terminal};
 
 const FONT_SIZE: f32 = 13.0;
 const FONT_FAMILY: &str = "Menlo";
@@ -554,8 +554,18 @@ impl TerminalView {
   /// trailing whitespace stripped per row and lines joined by `\n`.
   fn copy_selection_text(&self) -> Option<String> {
     let sel = self.selection?;
+    let (start, end) = sel.normalized();
+    let kind = match sel.mode {
+      SelectionMode::Cell => SelectionKind::Cell,
+      SelectionMode::Word => SelectionKind::Word,
+      SelectionMode::Line => SelectionKind::Line,
+    };
+    if let Some(text) = self.terminal.selected_text(start, end, kind) {
+      return Some(text);
+    }
+
     let snapshot = self.terminal.snapshot_grid();
-    let ((sr, sc), (er, ec)) = sel.normalized();
+    let ((sr, sc), (er, ec)) = (start, end);
     let last_row = er.min(snapshot.rows.len().saturating_sub(1));
     let mut out = String::new();
     for row_idx in sr..=last_row {

@@ -13,6 +13,8 @@ use std::sync::Arc;
 use alacritty_terminal::{
   event::{Event as AlacEvent, EventListener},
   grid::Dimensions,
+  index::{Column, Line, Point, Side},
+  selection::{Selection as AlacSelection, SelectionType},
   term::color,
   term::Config,
   vte::ansi::{Processor, StdSyncHandler},
@@ -81,6 +83,13 @@ pub struct Terminal {
   term: Arc<FairMutex<Term<ChannelListener>>>,
   processor: FairMutex<Processor<StdSyncHandler>>,
   events: Receiver<AlacEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionKind {
+  Cell,
+  Word,
+  Line,
 }
 
 impl Terminal {
@@ -185,6 +194,24 @@ impl Terminal {
     self.with_term(|term| term.cursor_style().blinking)
   }
 
+  /// Convert a display-coordinate selection to text using alacritty's own
+  /// selection serializer. This preserves terminal details like wrapped
+  /// lines and wide-character spacer cells better than reconstructing text
+  /// from our rendered cell snapshot.
+  pub fn selected_text(
+    &self,
+    start: (usize, usize),
+    end_exclusive: (usize, usize),
+    kind: SelectionKind,
+  ) -> Option<String> {
+    let mut term = self.term.lock();
+    let selection = selection_from_display_range(&term, start, end_exclusive, kind)?;
+    let previous = term.selection.replace(selection);
+    let text = term.selection_to_string();
+    term.selection = previous;
+    text
+  }
+
   /// Snapshot the visible grid as one `String` per row. Trailing whitespace
   /// is stripped per line. Used by debug/log paths; the styled view uses
   /// [`Terminal::snapshot_grid`] instead.
@@ -261,6 +288,46 @@ impl Terminal {
       }
     })
   }
+}
+
+fn selection_from_display_range(
+  term: &Term<ChannelListener>,
+  start: (usize, usize),
+  end_exclusive: (usize, usize),
+  kind: SelectionKind,
+) -> Option<AlacSelection> {
+  if start >= end_exclusive {
+    return None;
+  }
+
+  let display_offset = term.grid().display_offset() as i32;
+  let last_col = term.columns().saturating_sub(1);
+  let line_for_row = |row: usize| Line(row as i32 - display_offset);
+  let col = |col: usize| Column(col.min(last_col));
+
+  let selection_type = match kind {
+    // Word-mode is already snapped by the view. Use a simple alacritty range
+    // here so copied text exactly matches the visible highlighted cells.
+    SelectionKind::Cell | SelectionKind::Word => SelectionType::Simple,
+    SelectionKind::Line => SelectionType::Lines,
+  };
+
+  let start_point = Point::new(line_for_row(start.0), col(start.1));
+  let (end_row, end_col, end_side) = match selection_type {
+    SelectionType::Lines => (end_exclusive.0, 0, Side::Right),
+    _ if end_exclusive.1 == 0 => {
+      if end_exclusive.0 == 0 {
+        return None;
+      }
+      (end_exclusive.0 - 1, last_col, Side::Right)
+    }
+    _ => (end_exclusive.0, end_exclusive.1 - 1, Side::Right),
+  };
+
+  let end_point = Point::new(line_for_row(end_row), col(end_col));
+  let mut selection = AlacSelection::new(selection_type, start_point, Side::Left);
+  selection.update(end_point, end_side);
+  Some(selection)
 }
 
 /// One terminal cell flattened for rendering. Color is left as alacritty's
@@ -519,5 +586,40 @@ mod tests {
     // The two-cell width sequence repeats:
     assert_eq!(c1, ' '); // spacer renders as space
     let _ = c3; // unrelated cell, unused
+  }
+
+  #[test]
+  fn selected_text_uses_terminal_wrapped_line_serialization() {
+    let mut size = GridSize::new(3, 3);
+    size.scrollback = 10;
+    let t = Terminal::new(size);
+    t.write_remote(b"abcdef");
+
+    assert_eq!(
+      t.selected_text((0, 0), (1, 3), SelectionKind::Cell),
+      Some("abcdef".to_string())
+    );
+  }
+
+  #[test]
+  fn selected_text_skips_wide_char_spacer_cells() {
+    let t = Terminal::new(GridSize::new(3, 10));
+    t.write_remote("你x".as_bytes());
+
+    assert_eq!(
+      t.selected_text((0, 0), (0, 3), SelectionKind::Cell),
+      Some("你x".to_string())
+    );
+  }
+
+  #[test]
+  fn selected_text_line_mode_preserves_terminal_line_semantics() {
+    let t = Terminal::new(GridSize::new(3, 10));
+    t.write_remote(b"alpha\r\nbeta");
+
+    assert_eq!(
+      t.selected_text((0, 0), (0, 10), SelectionKind::Line),
+      Some("alpha\n".to_string())
+    );
   }
 }
