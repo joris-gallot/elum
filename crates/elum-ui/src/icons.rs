@@ -3,10 +3,6 @@
 //! Implements `gpui_component::IconNamed`, so values slot directly into
 //! `gpui_component::Icon::new(...)` and `Button::icon(...)`. Paths point
 //! into `crates/elum-ui/assets/`, served by [`crate::assets::AppAssets`].
-//!
-//! Adding an icon:
-//! 1. Drop the SVG into `crates/elum-ui/assets/icons/<name>.svg`.
-//! 2. Add a variant here and its `path()` arm.
 
 use gpui::SharedString;
 use gpui_component::IconNamed;
