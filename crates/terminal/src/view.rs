@@ -804,3 +804,177 @@ mod focus_report_tests {
     );
   }
 }
+
+#[cfg(test)]
+mod view_tests {
+  use super::*;
+  use gpui::{AppContext as _, Bounds, Entity, Size, TestAppContext};
+
+  #[derive(Debug, PartialEq, Eq)]
+  enum Captured {
+    ShellClosed,
+    Bell,
+    TitleChanged(Option<String>),
+  }
+
+  /// Test rig: a `TerminalView` plus the channel ends not owned by it,
+  /// so tests can both push input bytes and assert on outgoing PTY writes
+  /// / resize signals.
+  struct Rig {
+    terminal: Arc<Terminal>,
+    view: Entity<TerminalView>,
+    from_remote_tx: flume::Sender<Vec<u8>>,
+    _to_remote_rx: flume::Receiver<Vec<u8>>,
+    resize_rx: flume::Receiver<(u16, u16)>,
+  }
+
+  fn make_view(cx: &mut TestAppContext) -> Rig {
+    let terminal = Arc::new(Terminal::new(GridSize::new(24, 80)));
+    let (from_remote_tx, from_remote_rx) = flume::unbounded::<Vec<u8>>();
+    let (to_remote_tx, to_remote_rx) = flume::unbounded::<Vec<u8>>();
+    let (resize_tx, resize_rx) = flume::unbounded::<(u16, u16)>();
+
+    let view = cx.new(|cx| {
+      TerminalView::new(
+        terminal.clone(),
+        from_remote_rx,
+        to_remote_tx,
+        resize_tx,
+        (),
+        cx,
+      )
+    });
+
+    Rig {
+      terminal,
+      view,
+      from_remote_tx,
+      _to_remote_rx: to_remote_rx,
+      resize_rx,
+    }
+  }
+
+  /// Tiny entity that subscribes to the view's event stream and records
+  /// what it sees, so individual tests can match against a captured list.
+  struct Recorder {
+    events: Vec<Captured>,
+  }
+
+  fn record(rig: &Rig, cx: &mut TestAppContext) -> Entity<Recorder> {
+    let view = rig.view.clone();
+    cx.new(|cx| {
+      cx.subscribe(&view, |this: &mut Recorder, _, ev: &TerminalEvent, _| {
+        let captured = match ev {
+          TerminalEvent::ShellClosed => Captured::ShellClosed,
+          TerminalEvent::Bell => Captured::Bell,
+          TerminalEvent::TitleChanged(t) => Captured::TitleChanged(t.clone()),
+        };
+        this.events.push(captured);
+      })
+      .detach();
+      Recorder { events: Vec::new() }
+    })
+  }
+
+  fn first_row_text(terminal: &Terminal) -> String {
+    let snap = terminal.snapshot_grid();
+    snap.rows[0]
+      .iter()
+      .map(|c| c.c)
+      .collect::<String>()
+      .trim_end()
+      .to_string()
+  }
+
+  #[gpui::test]
+  async fn relay_pushes_bytes_into_grid(cx: &mut TestAppContext) {
+    let rig = make_view(cx);
+    rig.from_remote_tx.send(b"hello".to_vec()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(first_row_text(&rig.terminal), "hello");
+  }
+
+  #[gpui::test]
+  async fn bell_byte_emits_bell_event(cx: &mut TestAppContext) {
+    let rig = make_view(cx);
+    let recorder = record(&rig, cx);
+
+    rig.from_remote_tx.send(vec![0x07]).unwrap();
+    cx.run_until_parked();
+
+    recorder.read_with(cx, |r, _| {
+      assert!(
+        r.events.contains(&Captured::Bell),
+        "expected Bell, got {:?}",
+        r.events
+      );
+    });
+  }
+
+  #[gpui::test]
+  async fn relay_sender_drop_emits_shell_closed(cx: &mut TestAppContext) {
+    let rig = make_view(cx);
+    let recorder = record(&rig, cx);
+
+    // Dropping the only remote-side sender ends the relay loop and
+    // surfaces ShellClosed to subscribers (the workspace uses this to
+    // tear the tab down).
+    drop(rig.from_remote_tx);
+    cx.run_until_parked();
+
+    recorder.read_with(cx, |r, _| {
+      assert!(
+        r.events.contains(&Captured::ShellClosed),
+        "expected ShellClosed, got {:?}",
+        r.events
+      );
+    });
+  }
+
+  #[gpui::test]
+  async fn osc_title_emits_title_changed(cx: &mut TestAppContext) {
+    let rig = make_view(cx);
+    let recorder = record(&rig, cx);
+
+    // OSC 0 sets both the icon name and window title. `\x07` (BEL)
+    // terminates the sequence on most terminals; alacritty parses it.
+    rig
+      .from_remote_tx
+      .send(b"\x1b]0;mytitle\x07".to_vec())
+      .unwrap();
+    cx.run_until_parked();
+
+    recorder.read_with(cx, |r, _| {
+      let matched = r.events.iter().any(|e| match e {
+        Captured::TitleChanged(Some(t)) => t == "mytitle",
+        _ => false,
+      });
+      assert!(
+        matched,
+        "expected TitleChanged(\"mytitle\"), got {:?}",
+        r.events
+      );
+    });
+  }
+
+  #[gpui::test]
+  async fn sync_metrics_resizes_grid_and_pty(cx: &mut TestAppContext) {
+    let rig = make_view(cx);
+    // 400px / 8px = 50 columns. 160px / 16px = 10 rows.
+    let bounds = Bounds::new(Point::new(px(0.), px(0.)), Size::new(px(400.), px(160.)));
+
+    rig.view.update(cx, |v: &mut TerminalView, _| {
+      v.sync_metrics(px(8.), px(16.), bounds);
+    });
+
+    let (rows, cols) = rig.terminal.with_term(|t| {
+      use alacritty_terminal::grid::Dimensions;
+      (t.screen_lines(), t.columns())
+    });
+    assert_eq!(rows, 10);
+    assert_eq!(cols, 50);
+
+    let resize = rig.resize_rx.try_recv().expect("resize forwarded to PTY");
+    assert_eq!(resize, (50, 10));
+  }
+}
