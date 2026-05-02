@@ -5,6 +5,7 @@
 pub mod colors;
 pub mod element;
 pub mod keys;
+pub mod mouse;
 pub mod view;
 
 use std::sync::Arc;

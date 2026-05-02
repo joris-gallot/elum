@@ -12,8 +12,8 @@ use std::sync::Arc;
 use alacritty_terminal::event::{Event as AlacEvent, WindowSize};
 use gpui::{
   actions, div, px, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
-  InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels, Point, Render,
-  ScrollWheelEvent, Styled, Task, Window,
+  InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, ParentElement, Pixels,
+  Point, Render, ScrollWheelEvent, Styled, Task, Window,
 };
 
 actions!(terminal, [Copy, Paste, SelectAll,]);
@@ -33,6 +33,10 @@ pub enum TerminalEvent {
 use crate::colors::{default_background, default_foreground};
 use crate::element::TerminalElement;
 use crate::keys::keystroke_to_bytes;
+use crate::mouse::{
+  alt_scroll, mouse_button_report, mouse_move_report, mouse_reporting_enabled, scroll_report,
+  MouseCell, ScrollDirection,
+};
 use crate::{GridSize, Terminal};
 
 const FONT_SIZE: f32 = 13.0;
@@ -265,16 +269,36 @@ impl TerminalView {
   pub(crate) fn on_pointer_down(
     &mut self,
     pos: Point<Pixels>,
+    button: MouseButton,
+    modifiers: Modifiers,
     click_count: usize,
-    shift: bool,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
     window.focus(&self.focus, cx);
     let cell = self.pixel_to_cell(pos);
+    let mode = self.terminal.with_term(|term| *term.mode());
+
+    if let Some(bytes) = mouse_button_report(mouse_cell(cell), button, modifiers, true, mode) {
+      self.selection = None;
+      self.terminal.scroll_to_bottom();
+      let _ = self.to_remote.send(bytes);
+      cx.notify();
+      return;
+    }
+
+    if mouse_reporting_enabled(mode) {
+      self.selection = None;
+      cx.notify();
+      return;
+    }
+
+    if button != MouseButton::Left {
+      return;
+    }
 
     self.selection = match click_count {
-      0 | 1 if shift => {
+      0 | 1 if modifiers.shift => {
         let (anchor, origin) = self
           .selection
           .map_or((cell, cell), |s| (s.anchor, s.origin));
@@ -327,14 +351,34 @@ impl TerminalView {
     })
   }
 
-  pub(crate) fn on_pointer_move(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+  pub(crate) fn on_pointer_move(
+    &mut self,
+    pos: Point<Pixels>,
+    pressed_button: Option<MouseButton>,
+    modifiers: Modifiers,
+    cx: &mut Context<Self>,
+  ) {
+    let pointer = self.pixel_to_cell(pos);
+    let mode = self.terminal.with_term(|term| *term.mode());
+
+    if let Some(bytes) = mouse_move_report(mouse_cell(pointer), pressed_button, modifiers, mode) {
+      self.selection = None;
+      let _ = self.to_remote.send(bytes);
+      cx.notify();
+      return;
+    }
+
+    if mouse_reporting_enabled(mode) {
+      self.selection = None;
+      return;
+    }
+
     let Some(sel) = self.selection else {
       return;
     };
     if !sel.dragging {
       return;
     }
-    let pointer = self.pixel_to_cell(pos);
 
     // For Word/Line modes we need a fresh snapshot to recompute snapped
     // bounds. For Cell mode, the pointer cell is the focus.
@@ -392,7 +436,33 @@ impl TerminalView {
     }
   }
 
-  pub(crate) fn on_pointer_up(&mut self, _cx: &mut Context<Self>) {
+  pub(crate) fn on_pointer_up(
+    &mut self,
+    pos: Point<Pixels>,
+    button: MouseButton,
+    modifiers: Modifiers,
+    cx: &mut Context<Self>,
+  ) {
+    let cell = self.pixel_to_cell(pos);
+    let mode = self.terminal.with_term(|term| *term.mode());
+
+    if let Some(bytes) = mouse_button_report(mouse_cell(cell), button, modifiers, false, mode) {
+      self.selection = None;
+      let _ = self.to_remote.send(bytes);
+      cx.notify();
+      return;
+    }
+
+    if mouse_reporting_enabled(mode) {
+      self.selection = None;
+      cx.notify();
+      return;
+    }
+
+    if button != MouseButton::Left {
+      return;
+    }
+
     if let Some(sel) = self.selection.as_mut() {
       sel.dragging = false;
       // If the user merely clicked (no drag), the anchor and focus
@@ -426,6 +496,60 @@ impl TerminalView {
     )
   }
 
+  pub(crate) fn on_scroll_wheel_at(
+    &mut self,
+    pos: Point<Pixels>,
+    ev: &ScrollWheelEvent,
+    cx: &mut Context<Self>,
+  ) {
+    use alacritty_terminal::term::TermMode;
+
+    // Use the real measured line height when available; fall back to the
+    // FONT_SIZE-based heuristic only on the first frame.
+    let line_height = self
+      .last_cell_metrics
+      .map_or_else(|| px(FONT_SIZE * LINE_HEIGHT_RATIO), |(_, h)| h);
+    let pixel_y = ev.delta.pixel_delta(line_height).y;
+    self.scroll_px_acc += f32::from(pixel_y);
+
+    let line_h = f32::from(line_height);
+    let lines = (self.scroll_px_acc / line_h) as i32;
+    if lines == 0 {
+      return;
+    }
+    self.scroll_px_acc -= lines as f32 * line_h;
+
+    let mode = self.terminal.with_term(|term| *term.mode());
+    let cell = mouse_cell(self.pixel_to_cell(pos));
+    let direction = if lines.is_positive() {
+      ScrollDirection::Up
+    } else {
+      ScrollDirection::Down
+    };
+
+    if let Some(report) = scroll_report(cell, direction, ev.modifiers, mode) {
+      let count = lines.unsigned_abs() as usize;
+      let mut bytes = Vec::with_capacity(report.len() * count);
+      for _ in 0..count {
+        bytes.extend_from_slice(&report);
+      }
+      let _ = self.to_remote.send(bytes);
+      cx.notify();
+      return;
+    }
+
+    // Alt-screen apps (vim, htop, less, man, top, …) keep their own
+    // viewport; the local scrollback is empty there. When the remote
+    // also opted into ALTERNATE_SCROLL, translate wheel deltas into
+    // up/down arrow keystrokes so the app scrolls naturally.
+    if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+      let bytes = alt_scroll(lines, mode.contains(TermMode::APP_CURSOR));
+      let _ = self.to_remote.send(bytes);
+    } else {
+      self.terminal.scroll_lines(lines);
+    }
+  }
+
   /// Walk the current grid snapshot and gather the selected text, with
   /// trailing whitespace stripped per row and lines joined by `\n`.
   fn copy_selection_text(&self) -> Option<String> {
@@ -455,53 +579,6 @@ impl TerminalView {
       None
     } else {
       Some(out)
-    }
-  }
-
-  fn handle_scroll_wheel(
-    &mut self,
-    ev: &ScrollWheelEvent,
-    _window: &mut Window,
-    _cx: &mut Context<Self>,
-  ) {
-    use alacritty_terminal::term::TermMode;
-
-    // Use the real measured line height when available; fall back to the
-    // FONT_SIZE-based heuristic only on the first frame.
-    let line_height = self
-      .last_cell_metrics
-      .map_or_else(|| px(FONT_SIZE * LINE_HEIGHT_RATIO), |(_, h)| h);
-    let pixel_y = ev.delta.pixel_delta(line_height).y;
-    self.scroll_px_acc += f32::from(pixel_y);
-
-    let line_h = f32::from(line_height);
-    let lines = (self.scroll_px_acc / line_h) as i32;
-    if lines == 0 {
-      return;
-    }
-    self.scroll_px_acc -= lines as f32 * line_h;
-
-    let mode = self.terminal.with_term(|term| *term.mode());
-    // Alt-screen apps (vim, htop, less, man, top, …) keep their own
-    // viewport; the local scrollback is empty there. When the remote
-    // also opted into ALTERNATE_SCROLL, translate wheel deltas into
-    // up/down arrow keystrokes so the app scrolls naturally.
-    if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
-      let app_cursor = mode.contains(TermMode::APP_CURSOR);
-      let key: &[u8] = match (lines.is_positive(), app_cursor) {
-        (true, true) => b"\x1bOA",
-        (true, false) => b"\x1b[A",
-        (false, true) => b"\x1bOB",
-        (false, false) => b"\x1b[B",
-      };
-      let count = lines.unsigned_abs() as usize;
-      let mut bytes = Vec::with_capacity(key.len() * count);
-      for _ in 0..count {
-        bytes.extend_from_slice(key);
-      }
-      let _ = self.to_remote.send(bytes);
-    } else {
-      self.terminal.scroll_lines(lines);
     }
   }
 
@@ -667,6 +744,10 @@ fn pixels_to_u16(value: Pixels) -> u16 {
   f32::from(value).round().clamp(0.0, u16::MAX as f32) as u16
 }
 
+fn mouse_cell((row, col): (usize, usize)) -> MouseCell {
+  MouseCell::new(row, col)
+}
+
 /// Word-class predicate for double-click selection. Includes characters
 /// commonly found in identifiers, paths, and URLs so a double-click on
 /// `~/.config/foo.toml` selects the whole token rather than stopping at
@@ -725,7 +806,6 @@ impl Render for TerminalView {
       .on_action(cx.listener(Self::on_paste))
       .on_action(cx.listener(Self::on_select_all))
       .on_key_down(cx.listener(Self::handle_key_down))
-      .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
       .size_full()
       .bg(default_background())
       .text_color(default_foreground())

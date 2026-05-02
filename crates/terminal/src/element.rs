@@ -22,9 +22,9 @@ use std::sync::Arc;
 use gpui::{
   fill, point, px, relative, size, App, Bounds, CursorStyle, DispatchPhase, Element, ElementId,
   FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
-  IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-  Rgba, SharedString, Size, Style, TextAlign, TextRun, TextStyle, UnderlineStyle, WeakEntity,
-  Window,
+  IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba,
+  ScrollWheelEvent, SharedString, Size, Style, TextAlign, TextRun, TextStyle, UnderlineStyle,
+  WeakEntity, Window,
 };
 
 use crate::colors::{
@@ -244,7 +244,7 @@ impl TerminalElement {
     let down_view = self.view.clone();
     let down_hitbox = hitbox.clone();
     window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
-      if phase != DispatchPhase::Bubble || e.button != MouseButton::Left {
+      if phase != DispatchPhase::Bubble {
         return;
       }
       if !down_hitbox.is_hovered(window) {
@@ -252,33 +252,55 @@ impl TerminalElement {
       }
       let local = e.position - down_hitbox.bounds.origin;
       let click_count = e.click_count;
-      let shift = e.modifiers.shift;
+      let button = e.button;
+      let modifiers = e.modifiers;
       let _ = down_view.update(cx, |view, cx| {
-        view.on_pointer_down(local, click_count, shift, window, cx);
+        view.on_pointer_down(local, button, modifiers, click_count, window, cx);
       });
     });
 
     let move_view = self.view.clone();
     let move_hitbox = hitbox.clone();
-    window.on_mouse_event(move |e: &MouseMoveEvent, phase, _window, cx| {
+    window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
       if phase != DispatchPhase::Bubble {
         return;
       }
       // Drag continues even if the cursor leaves the hitbox. The view
       // itself decides whether to act based on `selection.dragging`.
+      if !move_hitbox.is_hovered(window) && e.pressed_button.is_none() {
+        return;
+      }
       let local = e.position - move_hitbox.bounds.origin;
+      let pressed_button = e.pressed_button;
+      let modifiers = e.modifiers;
       let _ = move_view.update(cx, |view, cx| {
-        view.on_pointer_move(local, cx);
+        view.on_pointer_move(local, pressed_button, modifiers, cx);
       });
     });
 
     let up_view = self.view.clone();
+    let up_hitbox = hitbox.clone();
     window.on_mouse_event(move |e: &MouseUpEvent, phase, _window, cx| {
-      if phase != DispatchPhase::Bubble || e.button != MouseButton::Left {
+      if phase != DispatchPhase::Bubble {
         return;
       }
+      let local = e.position - up_hitbox.bounds.origin;
+      let button = e.button;
+      let modifiers = e.modifiers;
       let _ = up_view.update(cx, |view, cx| {
-        view.on_pointer_up(cx);
+        view.on_pointer_up(local, button, modifiers, cx);
+      });
+    });
+
+    let scroll_view = self.view.clone();
+    let scroll_hitbox = hitbox.clone();
+    window.on_mouse_event(move |e: &ScrollWheelEvent, phase, window, cx| {
+      if phase != DispatchPhase::Bubble || !scroll_hitbox.should_handle_scroll(window) {
+        return;
+      }
+      let local = e.position - scroll_hitbox.bounds.origin;
+      let _ = scroll_view.update(cx, |view, cx| {
+        view.on_scroll_wheel_at(local, e, cx);
       });
     });
 
