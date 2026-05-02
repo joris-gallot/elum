@@ -225,8 +225,9 @@ impl Workspace {
 
       match join.await {
         Ok(Ok(shell)) => {
-          let _ = this.update(cx, move |this, cx| {
+          let _ = this.update_in(cx, move |this, window, cx| {
             this.finalize_tab(tab_id, Ok(shell), cx);
+            this.focus_active(window, cx);
           });
         }
         Ok(Err(err)) => {
