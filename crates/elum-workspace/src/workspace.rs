@@ -5,9 +5,10 @@ use elum_ssh::{ConnectConfig, Session, ShellHandle};
 use elum_terminal::view::TerminalView;
 use elum_terminal::{GridSize, Terminal};
 use gpui::{
-  actions, div, px, relative, AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable,
-  InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled, Window,
+  actions, div, px, relative, Action, AnyElement, App, AppContext, Context, Entity, FocusHandle,
+  Focusable, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled, Window,
 };
+use serde::Deserialize;
 use tokio::runtime::Runtime;
 
 use crate::host_book::{Host, HostBook};
@@ -27,6 +28,14 @@ actions!(
     Quit,
   ]
 );
+
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = elum, no_json)]
+pub struct EditHost(pub SharedString);
+
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = elum, no_json)]
+pub struct DeleteHost(pub SharedString);
 
 /// Key context for app-level bindings. Bindings registered under this
 /// context fire from anywhere within the app (including focused terminals).
@@ -233,10 +242,107 @@ impl Workspace {
       key_path: input.key_path,
     };
     self.host_book.add(host);
+    self.persist_host_book();
+    cx.notify();
+  }
+
+  pub(crate) fn replace_host_from_dialog(
+    &mut self,
+    host_id: &str,
+    input: NewHostInput,
+    cx: &mut Context<Self>,
+  ) {
+    let Some(idx) = self.host_book.hosts().iter().position(|h| h.id == host_id) else {
+      return;
+    };
+    let existing_id = self.host_book.hosts()[idx].id.clone();
+    let host = Host {
+      id: existing_id,
+      name: input.name,
+      host: input.host,
+      port: input.port,
+      user: input.user,
+      key_path: input.key_path,
+    };
+    self.host_book.replace(idx, host);
+    self.persist_host_book();
+    cx.notify();
+  }
+
+  /// Confirmed deletion: drops the host from the book and persists. Open
+  /// tabs that reference this host stay open — they own their own
+  /// connection state, no need to tear them down here.
+  pub(crate) fn remove_host_by_id(&mut self, host_id: &str, cx: &mut Context<Self>) {
+    let Some(idx) = self.host_book.hosts().iter().position(|h| h.id == host_id) else {
+      return;
+    };
+    self.host_book.remove(idx);
+    self.persist_host_book();
+    cx.notify();
+  }
+
+  fn persist_host_book(&self) {
     if let Err(e) = self.host_book.save() {
       eprintln!("warning: failed to persist host book: {e:#}");
     }
-    cx.notify();
+  }
+
+  fn on_edit_host(&mut self, action: &EditHost, window: &mut Window, cx: &mut Context<Self>) {
+    let host_id = action.0.to_string();
+    let Some(host) = self.host_book.hosts().iter().find(|h| h.id == host_id) else {
+      return;
+    };
+    let initial = NewHostInput {
+      name: host.name.clone(),
+      host: host.host.clone(),
+      port: host.port,
+      user: host.user.clone(),
+      key_path: host.key_path.clone(),
+    };
+    let view = cx.entity().downgrade();
+    add_host_dialog::open(window, cx, Some(initial), move |input, cx| {
+      let host_id = host_id.clone();
+      let _ = view.update(cx, |this, cx| {
+        this.replace_host_from_dialog(&host_id, input, cx);
+      });
+    });
+  }
+
+  fn on_delete_host(&mut self, action: &DeleteHost, window: &mut Window, cx: &mut Context<Self>) {
+    use gpui_component::{button::ButtonVariant, dialog::DialogButtonProps, WindowExt as _};
+
+    let host_id = action.0.to_string();
+    let Some(host) = self.host_book.hosts().iter().find(|h| h.id == host_id) else {
+      return;
+    };
+    let host_name = host.name.clone();
+    let view = cx.entity().downgrade();
+
+    window.open_alert_dialog(cx, move |alert, _, _| {
+      let view = view.clone();
+      let host_id = host_id.clone();
+
+      alert
+        .title("Remove host?")
+        .description(SharedString::from(format!(
+          "Permanently remove \"{host_name}\" from your hosts. Open tabs stay connected."
+        )))
+        .close_button(true)
+        .overlay_closable(true)
+        .button_props(
+          DialogButtonProps::default()
+            .show_cancel(true)
+            .ok_text("Remove")
+            .ok_variant(ButtonVariant::Danger)
+            .on_ok(move |_, _, cx| {
+              let host_id = host_id.clone();
+              let _ = view.update(cx, |this, cx| {
+                this.remove_host_by_id(&host_id, cx);
+              });
+              true
+            }),
+        )
+    });
   }
 
   fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -257,7 +363,7 @@ impl Workspace {
         let view = view.clone();
         move |_, window, cx| {
           let view = view.clone();
-          add_host_dialog::open(window, cx, move |input, cx| {
+          add_host_dialog::open(window, cx, None, move |input, cx| {
             let _ = view.update(cx, |app, cx| {
               app.add_host_from_dialog(input, cx);
             });
@@ -277,28 +383,26 @@ impl Workspace {
       .child(add_button);
 
     let menu = if self.host_book.is_empty() {
-      // `Sidebar::child` is constrained to `SidebarItem`, so the empty
-      // state has to live inside a SidebarMenu. A disabled item is the
-      // closest match for "informational placeholder".
       SidebarMenu::new().child(SidebarMenuItem::new("No hosts yet.").disable(true))
     } else {
       SidebarMenu::new().children(self.host_book.hosts().iter().enumerate().map(|(i, host)| {
-        let view = view.clone();
-        SidebarMenuItem::new(SharedString::from(host.name.clone())).on_click(
-          move |_, _window, cx| {
-            let _ = view.update(cx, |this, cx| {
+        let view_for_click = view.clone();
+        let host_id = SharedString::from(host.id.clone());
+        SidebarMenuItem::new(SharedString::from(host.name.clone()))
+          .on_click(move |_, _window, cx| {
+            let _ = view_for_click.update(cx, |this, cx| {
               this.connect_to_host(i, cx);
             });
-          },
-        )
+          })
+          .context_menu(move |menu, _, _| {
+            menu
+              .menu("Edit", Box::new(EditHost(host_id.clone())))
+              .separator()
+              .menu("Delete", Box::new(DeleteHost(host_id.clone())))
+          })
       }))
     };
 
-    // `w(relative(1.))` makes the Sidebar fill its parent (the
-    // `resizable_panel`); without it Sidebar's default fixed width
-    // would conflict with the panel and produce stray borders/handles.
-    // `border_0()` removes the default right border since the resize
-    // handle already provides the visual divider.
     Sidebar::new("hosts")
       .w(relative(1.))
       .border_0()
@@ -315,8 +419,7 @@ impl Workspace {
     };
 
     if self.tabs.is_empty() {
-      // Empty bar still gets rendered (for height stability) but with no
-      // tabs inside. Avoids `selected_index` panicking on a zero-tab bar.
+      // Empty bar still gets rendered (for height stability) but with no tabs inside.
       return div().h(px(TAB_BAR_HEIGHT_PX)).into_any_element();
     }
 
@@ -434,14 +537,12 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::on_next_tab))
       .on_action(cx.listener(Self::on_prev_tab))
       .on_action(cx.listener(Self::on_quit))
+      .on_action(cx.listener(Self::on_edit_host))
+      .on_action(cx.listener(Self::on_delete_host))
       .size_full()
       .bg(background)
       .text_color(foreground)
       .child(
-        // Pattern from gpui-component's gallery: only the sidebar gets a
-        // `resizable_panel` (fixed initial size + min/max). The right
-        // pane is passed as a raw element so it absorbs remaining space
-        // without an extra resize handle showing up between them.
         h_resizable("workspace-split")
           .child(
             resizable_panel()
@@ -454,9 +555,8 @@ impl Render for Workspace {
   }
 }
 
-/// Generate a stable-enough host ID from the wall clock. Collisions are
-/// effectively impossible for human-paced "Add Host" use; a UUID dep
-/// would be overkill until we need stronger guarantees.
+/// Generate a stable-enough host ID from the wall clock
+/// Collisions are effectively impossible for human-paced "Add Host" use
 fn generate_host_id() -> String {
   let ms = SystemTime::now()
     .duration_since(UNIX_EPOCH)

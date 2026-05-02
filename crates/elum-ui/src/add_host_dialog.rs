@@ -1,24 +1,3 @@
-//! Modal "Add Host" form.
-//!
-//! Uses `gpui_component::dialog::Dialog` directly (the general-purpose
-//! modal primitive) rather than `AlertDialog` / [`crate::ConfirmDialog`].
-//! `Dialog` is the right primitive for a form modal: it has explicit
-//! Header / Body / Footer slots, right-aligned action buttons, and full
-//! layout control.
-//!
-//! `AlertDialog` (and the `ConfirmDialog` builder we keep around for
-//! destructive actions) is for confirm-style modals where buttons are
-//! center-aligned and content is description text. Forms don't fit that
-//! shape.
-//!
-//! The dialog is domain-agnostic: it collects five string fields and
-//! hands them back via [`NewHostInput`]. The caller assigns IDs,
-//! persists, refreshes the sidebar, etc.
-//!
-//! Validation: name + host + user + key required, port must parse as a
-//! non-zero `u16`. Returning `false` from `on_ok` keeps the dialog open
-//! so the user can fix invalid input.
-
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -31,9 +10,6 @@ use gpui_component::{
   WindowExt as _,
 };
 
-/// The validated form values returned on submit. Kept intentionally
-/// narrow: just the data the form collects, not a domain `Host` (the
-/// caller assigns IDs and any extra metadata).
 #[derive(Debug, Clone)]
 pub struct NewHostInput {
   pub name: String,
@@ -43,23 +19,58 @@ pub struct NewHostInput {
   pub key_path: PathBuf,
 }
 
-/// Open the "Add Host" modal. `on_submit` runs on the GPUI main thread
-/// when the user confirms with valid input; it is given the form values
-/// plus a `&mut App` so it can update entities, write files, etc.
-pub fn open<F>(window: &mut Window, cx: &mut App, on_submit: F)
+pub fn open<F>(window: &mut Window, cx: &mut App, initial: Option<NewHostInput>, on_submit: F)
 where
   F: Fn(NewHostInput, &mut App) + 'static,
 {
-  // The submit handler is `Fn` (the dialog may rebuild between frames).
-  // Wrap in `Rc` so it stays cheaply cloneable as it's captured into
-  // nested closures.
   let on_submit = Rc::new(on_submit);
+  let is_editing = initial.is_some();
+  let title = if is_editing { "Edit Host" } else { "Add Host" };
+  let confirm_label = if is_editing { "Save" } else { "Add" };
 
-  let name = cx.new(|cx| InputState::new(window, cx).placeholder("My VPS"));
-  let host = cx.new(|cx| InputState::new(window, cx).placeholder("example.com or 1.2.3.4"));
-  let port = cx.new(|cx| InputState::new(window, cx).default_value("22"));
-  let user = cx.new(|cx| InputState::new(window, cx).placeholder("root"));
-  let key = cx.new(|cx| InputState::new(window, cx).placeholder("/Users/you/.ssh/id_ed25519"));
+  let name_default = initial.as_ref().map(|i| i.name.clone());
+  let host_default = initial.as_ref().map(|i| i.host.clone());
+  let port_default = initial
+    .as_ref()
+    .map_or_else(|| "22".to_string(), |i| i.port.to_string());
+  let user_default = initial.as_ref().map(|i| i.user.clone());
+  let key_default = initial
+    .as_ref()
+    .map(|i| i.key_path.to_string_lossy().to_string());
+
+  let name = cx.new(|cx| {
+    let s = InputState::new(window, cx).placeholder("My VPS");
+    if let Some(v) = name_default {
+      s.default_value(v)
+    } else {
+      s
+    }
+  });
+  let host = cx.new(|cx| {
+    let s = InputState::new(window, cx).placeholder("example.com or 1.2.3.4");
+    if let Some(v) = host_default {
+      s.default_value(v)
+    } else {
+      s
+    }
+  });
+  let port = cx.new(|cx| InputState::new(window, cx).default_value(port_default));
+  let user = cx.new(|cx| {
+    let s = InputState::new(window, cx).placeholder("root");
+    if let Some(v) = user_default {
+      s.default_value(v)
+    } else {
+      s
+    }
+  });
+  let key = cx.new(|cx| {
+    let s = InputState::new(window, cx).placeholder("/Users/you/.ssh/id_ed25519");
+    if let Some(v) = key_default {
+      s.default_value(v)
+    } else {
+      s
+    }
+  });
 
   window.open_dialog(cx, move |dialog, _, _| {
     let name = name.clone();
@@ -103,13 +114,13 @@ where
 
     dialog
       .w(px(440.))
-      .title("Add Host")
+      .title(title)
       .child(body)
       .footer(
         DialogFooter::new()
           .gap_2()
           .child(DialogClose::new().child(Button::new("cancel").outline().label("Cancel")))
-          .child(DialogAction::new().child(Button::new("save").primary().label("Save"))),
+          .child(DialogAction::new().child(Button::new("save").primary().label(confirm_label))),
       )
       .on_ok(move |_, _window, cx| {
         let name_v = read_value(&name, cx);
