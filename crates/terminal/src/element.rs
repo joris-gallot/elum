@@ -20,10 +20,11 @@
 use std::sync::Arc;
 
 use gpui::{
-  fill, point, px, relative, size, App, Bounds, DispatchPhase, Element, ElementId, FontStyle,
-  FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement,
-  LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba,
-  SharedString, Size, Style, TextAlign, TextRun, TextStyle, UnderlineStyle, WeakEntity, Window,
+  fill, point, px, relative, size, App, Bounds, CursorStyle, DispatchPhase, Element, ElementId,
+  FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
+  IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+  Rgba, SharedString, Size, Style, TextAlign, TextRun, TextStyle, UnderlineStyle, WeakEntity,
+  Window,
 };
 
 use crate::colors::{
@@ -223,13 +224,15 @@ impl TerminalElement {
         return;
       }
       let local = e.position - down_hitbox.bounds.origin;
+      let click_count = e.click_count;
+      let shift = e.modifiers.shift;
       let _ = down_view.update(cx, |view, cx| {
-        view.on_pointer_down(local, window, cx);
+        view.on_pointer_down(local, click_count, shift, window, cx);
       });
     });
 
     let move_view = self.view.clone();
-    let move_hitbox = hitbox;
+    let move_hitbox = hitbox.clone();
     window.on_mouse_event(move |e: &MouseMoveEvent, phase, _window, cx| {
       if phase != DispatchPhase::Bubble {
         return;
@@ -251,6 +254,11 @@ impl TerminalElement {
         view.on_pointer_up(cx);
       });
     });
+
+    // Show the I-beam cursor while hovering the terminal so the user
+    // visually knows text is selectable. Must be inside paint with the
+    // hitbox in scope.
+    window.set_cursor_style(CursorStyle::IBeam, &hitbox);
   }
 }
 

@@ -214,23 +214,85 @@ impl TerminalView {
   }
 
   /// Pointer pressed inside the terminal area. `pos` is element-local
-  /// (already shifted by the hitbox origin in [`crate::element`]).
+  ///
+  /// Selection variants:
+  /// - `click_count == 1` and no shift: start a fresh drag selection.
+  /// - `click_count == 1` and shift: extend the existing selection's focus
+  ///   to the clicked cell (or start a new one if none exists).
+  /// - `click_count == 2`: select the word under the cursor.
+  /// - `click_count >= 3`: select the entire line under the cursor.
   pub(crate) fn on_pointer_down(
     &mut self,
     pos: Point<Pixels>,
+    click_count: usize,
+    shift: bool,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    // Make sure keystrokes go to us right after a click, even if focus
-    // was previously elsewhere (e.g. the sidebar).
     window.focus(&self.focus, cx);
     let cell = self.pixel_to_cell(pos);
-    self.selection = Some(Selection {
-      anchor: cell,
-      focus: cell,
-      dragging: true,
-    });
+
+    self.selection = match click_count {
+      0 | 1 if shift => {
+        let anchor = self.selection.map_or(cell, |s| s.anchor);
+        Some(Selection {
+          anchor,
+          focus: cell,
+          dragging: false,
+        })
+      }
+      0 | 1 => Some(Selection {
+        anchor: cell,
+        focus: cell,
+        dragging: true,
+      }),
+      2 => self.word_selection_at(cell),
+      _ => self.line_selection_at(cell),
+    };
     cx.notify();
+  }
+
+  /// Returns a selection covering the word that contains `(row, col)`,
+  /// where "word" is a run of identifier-like characters (alphanumeric +
+  /// `_-./~`). Whitespace cells return a single-cell selection.
+  fn word_selection_at(&self, (row, col): (usize, usize)) -> Option<Selection> {
+    let snapshot = self.terminal.snapshot_grid();
+    let row_cells = snapshot.rows.get(row)?;
+    let center = row_cells.get(col)?;
+    if !is_word_char(center.c) {
+      return Some(Selection {
+        anchor: (row, col),
+        focus: (row, col + 1),
+        dragging: false,
+      });
+    }
+    let mut start = col;
+    while start > 0
+      && row_cells
+        .get(start - 1)
+        .is_some_and(|cell| is_word_char(cell.c))
+    {
+      start -= 1;
+    }
+    let mut end = col;
+    while end < row_cells.len() && is_word_char(row_cells[end].c) {
+      end += 1;
+    }
+    Some(Selection {
+      anchor: (row, start),
+      focus: (row, end),
+      dragging: false,
+    })
+  }
+
+  fn line_selection_at(&self, (row, _): (usize, usize)) -> Option<Selection> {
+    let snapshot = self.terminal.snapshot_grid();
+    let row_cells = snapshot.rows.get(row)?;
+    Some(Selection {
+      anchor: (row, 0),
+      focus: (row, row_cells.len()),
+      dragging: false,
+    })
   }
 
   pub(crate) fn on_pointer_move(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
@@ -358,6 +420,14 @@ impl Focusable for TerminalView {
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
+
+/// Word-class predicate for double-click selection. Includes characters
+/// commonly found in identifiers, paths, and URLs so a double-click on
+/// `~/.config/foo.toml` selects the whole token rather than stopping at
+/// each separator.
+fn is_word_char(c: char) -> bool {
+  c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~' | ':')
+}
 
 impl Render for TerminalView {
   fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
