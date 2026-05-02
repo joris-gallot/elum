@@ -62,7 +62,6 @@ impl Mods {
 
 /// Encode a `Keystroke` as the byte sequence to send over the SSH channel.
 /// Returns `None` if the keystroke has no terminal-meaningful encoding
-/// (e.g. unmodified Ctrl held alone, an unknown key name).
 pub fn keystroke_to_bytes(ks: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
   let mods = Mods::of(ks);
   let key = ks.key.as_str();
@@ -71,29 +70,13 @@ pub fn keystroke_to_bytes(ks: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
     return Some(bytes);
   }
 
-  // Ctrl-letter: a..z map to 0x01..0x1a. Standard since the 1970s.
+  // Ctrl-letter: a..z map to 0x01..0x1a
   if mods == Mods::Ctrl
     && key.len() == 1
     && key.chars().next().is_some_and(|c| c.is_ascii_lowercase())
   {
     let byte = key.bytes().next().unwrap() - b'a' + 1;
     return Some(vec![byte]);
-  }
-
-  // Plain printable input. Trust `key_char` first - GPUI sets it to the
-  // literal character that would be typed (handles space, altgr, IME,
-  // shifted letters). Only consult the bare `key` string if no char was
-  // provided AND the key isn't a known named special - otherwise we'd
-  // emit literal "tab" / "f1" / etc. as bytes.
-  if matches!(mods, Mods::None | Mods::Shift) {
-    if let Some(text) = ks.key_char.as_deref() {
-      if !text.is_empty() {
-        return Some(text.as_bytes().to_vec());
-      }
-    }
-    if !is_named_key(key) {
-      return Some(key.as_bytes().to_vec());
-    }
   }
 
   None
@@ -208,42 +191,6 @@ fn tilde_num(key: &str) -> Option<u32> {
     "f12" => 24,
     _ => return None,
   })
-}
-
-/// Returns true for keys that are named (and shouldn't be passed through as
-/// printable text). Prevents `keystroke_to_bytes` from emitting the literal
-/// strings "enter", "tab", etc. when no special-key match was found.
-fn is_named_key(key: &str) -> bool {
-  matches!(
-    key,
-    "tab"
-      | "escape"
-      | "enter"
-      | "backspace"
-      | "space"
-      | "home"
-      | "end"
-      | "up"
-      | "down"
-      | "left"
-      | "right"
-      | "insert"
-      | "delete"
-      | "pageup"
-      | "pagedown"
-      | "f1"
-      | "f2"
-      | "f3"
-      | "f4"
-      | "f5"
-      | "f6"
-      | "f7"
-      | "f8"
-      | "f9"
-      | "f10"
-      | "f11"
-      | "f12"
-  )
 }
 
 #[cfg(test)]
@@ -397,21 +344,15 @@ mod tests {
   }
 
   #[test]
-  fn printable_letter_passes_through() {
-    assert_eq!(
-      keystroke_to_bytes(&ks("a"), TermMode::empty()),
-      Some(b"a".to_vec())
-    );
-  }
-
-  #[test]
-  fn shift_letter_uses_key_char_when_present() {
-    let mut k = ks_with("a", shift());
-    k.key_char = Some("A".into());
-    assert_eq!(
-      keystroke_to_bytes(&k, TermMode::empty()),
-      Some(b"A".to_vec())
-    );
+  fn plain_letter_returns_none_so_ime_handles_it() {
+    // Plain printable text is delivered via the platform IME pipeline
+    // (`InputHandler::replace_text_in_range`), not via `KeyDownEvent`,
+    // so this function deliberately drops it on the floor to avoid
+    // double input.
+    assert_eq!(keystroke_to_bytes(&ks("a"), TermMode::empty()), None);
+    let mut shifted = ks_with("a", shift());
+    shifted.key_char = Some("A".into());
+    assert_eq!(keystroke_to_bytes(&shifted, TermMode::empty()), None);
   }
 
   #[test]
@@ -533,23 +474,11 @@ mod tests {
   }
 
   #[test]
-  fn space_with_key_char_emits_space_byte() {
-    // GPUI on macOS emits `key = "space"` with `key_char = Some(" ")`
-    // when the spacebar is pressed unmodified. We must trust key_char
-    // and not let `is_named_key("space")` swallow the byte.
+  fn space_returns_none_so_ime_handles_it() {
+    // Plain space is printable text - the IME pipeline emits it.
     let mut k = ks("space");
     k.key_char = Some(" ".into());
-    assert_eq!(
-      keystroke_to_bytes(&k, TermMode::empty()),
-      Some(b" ".to_vec())
-    );
-  }
-
-  #[test]
-  fn space_without_key_char_returns_none() {
-    // Defensive: if no platform-provided char (test harness without
-    // setting key_char), the named-key guard correctly suppresses
-    // emitting the literal string "space".
+    assert_eq!(keystroke_to_bytes(&k, TermMode::empty()), None);
     assert_eq!(keystroke_to_bytes(&ks("space"), TermMode::empty()), None);
   }
 

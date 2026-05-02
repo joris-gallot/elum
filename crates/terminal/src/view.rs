@@ -54,9 +54,6 @@ pub struct TerminalView {
   to_remote: flume::Sender<Vec<u8>>,
   resize_remote: flume::Sender<(u16, u16)>,
   last_size: Option<(u16, u16)>,
-  /// Real cell metrics measured by the element on the most recent paint.
-  /// `None` only before the first frame; `pixel_to_cell` falls back to a
-  /// heuristic in that brief window.
   last_cell_metrics: Option<(Pixels, Pixels)>,
   /// Sub-line accumulator for `ScrollWheelEvent` pixel deltas.
   scroll_px_acc: f32,
@@ -64,6 +61,10 @@ pub struct TerminalView {
   /// drag updates. The selection itself lives in `term.selection`.
   dragging: bool,
   cursor_blink_phase: bool,
+  /// Pre-edit text from the platform IME while a composition is in
+  /// progress, `None` when no composition is active. Painted by the
+  /// element with an underline overlay at the cursor position.
+  marked_text: Option<String>,
   focus: FocusHandle,
   _focus_in: Option<Subscription>,
   _focus_out: Option<Subscription>,
@@ -129,6 +130,7 @@ impl TerminalView {
       scroll_px_acc: 0.0,
       dragging: false,
       cursor_blink_phase: true,
+      marked_text: None,
       focus,
       _focus_in: None,
       _focus_out: None,
@@ -150,6 +152,49 @@ impl TerminalView {
         this.on_focus_changed(false, cx);
       }),
     );
+  }
+
+  /// Borrow the focus handle. The element needs it to register the
+  /// platform [`gpui::InputHandler`] in its paint phase.
+  pub(crate) fn focus(&self) -> &FocusHandle {
+    &self.focus
+  }
+
+  /// Currently composing text from the IME (pre-edit), if any. The
+  /// element paints this with an underline at the cursor.
+  pub(crate) fn marked_text(&self) -> Option<&str> {
+    self.marked_text.as_deref()
+  }
+
+  /// IME callback: replace the pre-edit text. An empty string clears
+  /// the marked state. Notifies the view so the element repaints.
+  pub(crate) fn set_marked_text(&mut self, text: String, cx: &mut Context<Self>) {
+    if text.is_empty() {
+      self.clear_marked_text(cx);
+      return;
+    }
+    self.marked_text = Some(text);
+    cx.notify();
+  }
+
+  /// IME callback: drop any pre-edit state without committing.
+  pub(crate) fn clear_marked_text(&mut self, cx: &mut Context<Self>) {
+    if self.marked_text.take().is_some() {
+      cx.notify();
+    }
+  }
+
+  /// IME callback: the user accepted a candidate, push the bytes
+  /// into the PTY and bring the viewport back to the live tail. Marked
+  /// state is dropped by the platform separately via `clear_marked_text`.
+  pub(crate) fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
+    if text.is_empty() {
+      return;
+    }
+    self.terminal.scroll_to_bottom();
+    self.terminal.clear_selection();
+    let _ = self.to_remote.send(text.as_bytes().to_vec());
+    cx.notify();
   }
 
   fn handle_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
@@ -824,7 +869,7 @@ mod view_tests {
     terminal: Arc<Terminal>,
     view: Entity<TerminalView>,
     from_remote_tx: flume::Sender<Vec<u8>>,
-    _to_remote_rx: flume::Receiver<Vec<u8>>,
+    to_remote_rx: flume::Receiver<Vec<u8>>,
     resize_rx: flume::Receiver<(u16, u16)>,
   }
 
@@ -849,7 +894,7 @@ mod view_tests {
       terminal,
       view,
       from_remote_tx,
-      _to_remote_rx: to_remote_rx,
+      to_remote_rx,
       resize_rx,
     }
   }
@@ -976,5 +1021,64 @@ mod view_tests {
 
     let resize = rig.resize_rx.try_recv().expect("resize forwarded to PTY");
     assert_eq!(resize, (50, 10));
+  }
+
+  #[gpui::test]
+  async fn ime_set_marked_text_records_pre_edit(cx: &mut TestAppContext) {
+    let rig = make_view(cx);
+    rig.view.update(cx, |v: &mut TerminalView, cx| {
+      v.set_marked_text("ni".into(), cx);
+    });
+    rig.view.read_with(cx, |v, _| {
+      assert_eq!(v.marked_text(), Some("ni"));
+    });
+  }
+
+  #[gpui::test]
+  async fn ime_set_marked_text_with_empty_clears(cx: &mut TestAppContext) {
+    let rig = make_view(cx);
+    rig.view.update(cx, |v: &mut TerminalView, cx| {
+      v.set_marked_text("ni".into(), cx);
+      // Platform sometimes signals "stop composing" with an empty
+      // string; that should drop the marked state, not paint "" on
+      // top of the grid.
+      v.set_marked_text(String::new(), cx);
+    });
+    rig.view.read_with(cx, |v, _| {
+      assert_eq!(v.marked_text(), None);
+    });
+  }
+
+  #[gpui::test]
+  async fn ime_commit_text_sends_bytes_to_pty(cx: &mut TestAppContext) {
+    let rig = make_view(cx);
+    rig.view.update(cx, |v: &mut TerminalView, cx| {
+      // Simulate the platform calling `replace_text_in_range` after the
+      // user picks a candidate from the IME popup.
+      v.set_marked_text("ni hao".into(), cx);
+      v.clear_marked_text(cx);
+      v.commit_text("你好", cx);
+    });
+
+    rig.view.read_with(cx, |v, _| {
+      assert_eq!(v.marked_text(), None);
+    });
+    let bytes = rig
+      .to_remote_rx
+      .try_recv()
+      .expect("commit forwarded to PTY");
+    assert_eq!(bytes, "你好".as_bytes());
+  }
+
+  #[gpui::test]
+  async fn ime_commit_empty_text_is_a_noop(cx: &mut TestAppContext) {
+    let rig = make_view(cx);
+    rig.view.update(cx, |v: &mut TerminalView, cx| {
+      v.commit_text("", cx);
+    });
+    assert!(
+      rig.to_remote_rx.try_recv().is_err(),
+      "empty commit must not write to the PTY"
+    );
   }
 }

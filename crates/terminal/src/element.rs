@@ -23,10 +23,10 @@ use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
   fill, point, px, relative, size, App, Bounds, CursorStyle, DispatchPhase, Element, ElementId,
-  FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
-  IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba,
-  ScrollWheelEvent, SharedString, Size, Style, TextAlign, TextRun, TextStyle, UnderlineStyle,
-  WeakEntity, Window,
+  FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InputHandler,
+  InspectorElementId, IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+  Point, Rgba, ScrollWheelEvent, SharedString, Size, Style, TextAlign, TextRun, TextStyle,
+  UTF16Selection, UnderlineStyle, WeakEntity, Window,
 };
 
 use crate::colors::{
@@ -198,7 +198,16 @@ impl Element for TerminalElement {
     // Pass 3: non-filled cursor decorations (hollow border, beam, underline).
     paint_cursor_overlay(cursor_kind, &ctx, window);
 
+    // Pass 4: marked text overlay if the IME is composing.
+    if let Some(view) = self.view.upgrade() {
+      let marked = view.read(cx).marked_text().map(str::to_owned);
+      if let Some(text) = marked {
+        paint_marked_text_overlay(&ctx, &text, window, cx);
+      }
+    }
+
     self.register_mouse_listeners(prepaint.hitbox.clone(), window);
+    self.register_input_handler(&ctx, window, cx);
   }
 }
 
@@ -277,10 +286,28 @@ impl TerminalElement {
     // hitbox in scope.
     window.set_cursor_style(CursorStyle::IBeam, &hitbox);
   }
+
+  /// Register the platform IME pipeline so non-ASCII / composition input reaches the PTY
+  fn register_input_handler(&self, ctx: &PaintCtx<'_>, window: &mut Window, cx: &mut App) {
+    let Some(view) = self.view.upgrade() else {
+      return;
+    };
+    let focus = view.read(cx).focus().clone();
+    let cursor_bounds = Some(Bounds::new(
+      Point::new(
+        ctx.origin.x + ctx.cell_w * ctx.cursor.1 as f32,
+        ctx.origin.y + ctx.line_h * ctx.cursor.0 as f32,
+      ),
+      Size::new(ctx.cell_w, ctx.line_h),
+    ));
+    let handler = TerminalInputHandler {
+      view: self.view.clone(),
+      cursor_bounds,
+    };
+    window.handle_input(&focus, handler, cx);
+  }
 }
 
-/// How the cursor should be drawn this frame, derived once at the start
-/// of paint from snapshot + focus + blink phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CursorKind {
   None,
@@ -376,6 +403,46 @@ fn paint_cursor_overlay(kind: CursorKind, ctx: &PaintCtx<'_>, window: &mut Windo
     }
     CursorKind::None | CursorKind::Filled => unreachable!(),
   }
+}
+
+/// Paint the IME pre-edit text on top of the terminal grid at the cursor position
+fn paint_marked_text_overlay(ctx: &PaintCtx<'_>, marked: &str, window: &mut Window, cx: &mut App) {
+  if marked.is_empty() {
+    return;
+  }
+  let (row, col) = ctx.cursor;
+  let origin = point(
+    ctx.origin.x + ctx.cell_w * col as f32,
+    ctx.origin.y + ctx.line_h * row as f32,
+  );
+
+  let mut style = ctx.text_style.clone();
+  style.underline = Some(UnderlineStyle {
+    color: Some(style.color),
+    thickness: px(1.0),
+    wavy: false,
+  });
+  let runs = vec![TextRun {
+    len: marked.len(),
+    font: style.font(),
+    color: style.color,
+    background_color: None,
+    underline: style.underline,
+    strikethrough: None,
+  }];
+  let shaped = window.text_system().shape_line(
+    SharedString::from(marked.to_string()),
+    ctx.font_size,
+    &runs,
+    None,
+  );
+
+  // Clear the area behind the marked text so the cell glyphs at the
+  // cursor (and any wraparound) don't bleed through the composing line.
+  let cover = Bounds::new(origin, Size::new(shaped.width, ctx.line_h));
+  window.paint_quad(fill(cover, ctx.bg_default));
+
+  let _ = shaped.paint(origin, ctx.line_h, TextAlign::Left, None, window, cx);
 }
 
 fn paint_row_backgrounds(
@@ -589,5 +656,108 @@ fn row_run_style(
     } else {
       None
     },
+  }
+}
+
+struct TerminalInputHandler {
+  view: WeakEntity<TerminalView>,
+  /// Cursor cell rect in element-local coordinates plus the element's
+  /// origin offset, used to anchor the IME candidate window beside the caret
+  cursor_bounds: Option<Bounds<Pixels>>,
+}
+
+impl InputHandler for TerminalInputHandler {
+  fn selected_text_range(
+    &mut self,
+    _ignore_disabled_input: bool,
+    _window: &mut Window,
+    _cx: &mut App,
+  ) -> Option<UTF16Selection> {
+    // The terminal has no editable selection in the input-handler sense
+    Some(UTF16Selection {
+      range: 0..0,
+      reversed: false,
+    })
+  }
+
+  fn marked_text_range(
+    &mut self,
+    _window: &mut Window,
+    cx: &mut App,
+  ) -> Option<std::ops::Range<usize>> {
+    let len = self
+      .view
+      .upgrade()?
+      .read(cx)
+      .marked_text()
+      .map(|s| s.encode_utf16().count())?;
+    Some(0..len)
+  }
+
+  fn text_for_range(
+    &mut self,
+    _range_utf16: std::ops::Range<usize>,
+    _adjusted_range: &mut Option<std::ops::Range<usize>>,
+    _window: &mut Window,
+    _cx: &mut App,
+  ) -> Option<String> {
+    // The terminal grid isn't an editable document
+    // the IME has no use for arbitrary substrings of it
+    None
+  }
+
+  fn replace_text_in_range(
+    &mut self,
+    _replacement_range: Option<std::ops::Range<usize>>,
+    text: &str,
+    _window: &mut Window,
+    cx: &mut App,
+  ) {
+    let _ = self.view.update(cx, |view, cx| {
+      view.clear_marked_text(cx);
+      view.commit_text(text, cx);
+    });
+  }
+
+  fn replace_and_mark_text_in_range(
+    &mut self,
+    _range_utf16: Option<std::ops::Range<usize>>,
+    new_text: &str,
+    _new_selected_range: Option<std::ops::Range<usize>>,
+    _window: &mut Window,
+    cx: &mut App,
+  ) {
+    let _ = self.view.update(cx, |view, cx| {
+      view.set_marked_text(new_text.to_string(), cx);
+    });
+  }
+
+  fn unmark_text(&mut self, _window: &mut Window, cx: &mut App) {
+    let _ = self.view.update(cx, |view, cx| {
+      view.clear_marked_text(cx);
+    });
+  }
+
+  fn bounds_for_range(
+    &mut self,
+    _range_utf16: std::ops::Range<usize>,
+    _window: &mut Window,
+    _cx: &mut App,
+  ) -> Option<Bounds<Pixels>> {
+    self.cursor_bounds
+  }
+
+  fn character_index_for_point(
+    &mut self,
+    _point: Point<Pixels>,
+    _window: &mut Window,
+    _cx: &mut App,
+  ) -> Option<usize> {
+    // No editable document layout to map points into.
+    None
+  }
+
+  fn apple_press_and_hold_enabled(&mut self) -> bool {
+    false
   }
 }
