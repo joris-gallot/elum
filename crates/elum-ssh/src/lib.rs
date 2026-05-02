@@ -32,14 +32,23 @@ impl client::Handler for ClientHandler {
   }
 }
 
-/// Parameters for opening a connection.
+#[derive(Debug, Clone)]
+pub enum AuthMethod {
+  PublicKey {
+    key_path: std::path::PathBuf,
+    passphrase: Option<String>,
+  },
+  Password {
+    password: String,
+  },
+}
+
 #[derive(Debug, Clone)]
 pub struct ConnectConfig {
   pub host: String,
   pub port: u16,
   pub user: String,
-  pub key_path: std::path::PathBuf,
-  pub key_passphrase: Option<String>,
+  pub auth: AuthMethod,
   /// Skip host-key validation. Currently always true while we don't have a
   /// known_hosts store; flagged so callers can flip it once we do.
   pub accept_any_host_key: bool,
@@ -50,16 +59,32 @@ impl ConnectConfig {
     host: impl Into<String>,
     port: u16,
     user: impl Into<String>,
-    key_path: impl AsRef<Path>,
+    auth: AuthMethod,
   ) -> Self {
     Self {
       host: host.into(),
       port,
       user: user.into(),
-      key_path: key_path.as_ref().to_path_buf(),
-      key_passphrase: None,
+      auth,
       accept_any_host_key: true,
     }
+  }
+
+  pub fn with_public_key(
+    host: impl Into<String>,
+    port: u16,
+    user: impl Into<String>,
+    key_path: impl AsRef<Path>,
+  ) -> Self {
+    Self::new(
+      host,
+      port,
+      user,
+      AuthMethod::PublicKey {
+        key_path: key_path.as_ref().to_path_buf(),
+        passphrase: None,
+      },
+    )
   }
 }
 
@@ -78,7 +103,7 @@ pub struct Session {
 }
 
 impl Session {
-  /// Open a TCP+SSH connection and authenticate using a public key file.
+  /// Open a TCP+SSH connection and authenticate using the configured method.
   pub async fn connect(cfg: &ConnectConfig) -> Result<Self> {
     let config = Arc::new(client::Config::default());
     let handler = ClientHandler {
@@ -89,20 +114,29 @@ impl Session {
       .await
       .with_context(|| format!("connecting to {}:{}", cfg.host, cfg.port))?;
 
-    let key = load_secret_key(&cfg.key_path, cfg.key_passphrase.as_deref())
-      .with_context(|| format!("loading key from {}", cfg.key_path.display()))?;
-
-    // RSA hash negotiation only matters for RSA keys; Ed25519/ECDSA pass
-    // `None`. Asking the server is cheap and handles all key types.
-    let rsa_hash = handle.best_supported_rsa_hash().await?.flatten();
-
-    let auth = handle
-      .authenticate_publickey(
-        &cfg.user,
-        PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash),
-      )
-      .await
-      .context("public-key authentication failed")?;
+    let auth = match &cfg.auth {
+      AuthMethod::PublicKey {
+        key_path,
+        passphrase,
+      } => {
+        let key = load_secret_key(key_path, passphrase.as_deref())
+          .with_context(|| format!("loading key from {}", key_path.display()))?;
+        // RSA hash negotiation only matters for RSA keys; Ed25519/ECDSA pass
+        // `None`. Asking the server is cheap and handles all key types.
+        let rsa_hash = handle.best_supported_rsa_hash().await?.flatten();
+        handle
+          .authenticate_publickey(
+            &cfg.user,
+            PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash),
+          )
+          .await
+          .context("public-key authentication failed")?
+      }
+      AuthMethod::Password { password } => handle
+        .authenticate_password(&cfg.user, password)
+        .await
+        .context("password authentication failed")?,
+    };
 
     if !auth.success() {
       return Err(anyhow!("authentication rejected for user `{}`", cfg.user));

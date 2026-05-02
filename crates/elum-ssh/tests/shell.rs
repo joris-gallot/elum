@@ -21,7 +21,7 @@ fn test_key_path() -> PathBuf {
 }
 
 fn test_config() -> ConnectConfig {
-  ConnectConfig::new("127.0.0.1", 2222, "testuser", test_key_path())
+  ConnectConfig::with_public_key("127.0.0.1", 2222, "testuser", test_key_path())
 }
 
 /// Drain bytes from the shell until `needle` appears or the deadline elapses.

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use elum_ssh::{ConnectConfig, Session, ShellHandle};
+use elum_ssh::{AuthMethod, ConnectConfig, Session, ShellHandle};
 use elum_terminal::view::TerminalView;
 use elum_terminal::{GridSize, Terminal};
 use gpui::{
@@ -11,10 +11,10 @@ use gpui::{
 use serde::Deserialize;
 use tokio::runtime::Runtime;
 
-use crate::host_book::{Host, HostBook};
+use crate::host_book::{Host, HostAuth, HostBook};
 use crate::keychain;
-use elum_ui::add_host_dialog::{self, NewHostInput};
-use elum_ui::passphrase_prompt;
+use elum_ui::add_host_dialog::{self, NewAuth, NewHostInput};
+use elum_ui::secret_prompt::{self, SecretPrompt};
 use elum_ui::UiIconName;
 
 actions!(
@@ -118,44 +118,101 @@ impl Workspace {
     let Some(host) = self.host_book.hosts().get(host_idx).cloned() else {
       return;
     };
-    let id = self.next_tab_id;
+    let tab_id = self.next_tab_id;
     self.next_tab_id += 1;
     self.tabs.push(Tab {
-      id,
+      id: tab_id,
       host: host.clone(),
       state: TabState::Connecting,
     });
     self.active_tab = Some(self.tabs.len() - 1);
     cx.notify();
 
-    let passphrase = if host.passphrase_in_keychain {
-      keychain::fetch(&host.id)
-    } else {
-      None
-    };
-    self.spawn_connect(id, host, passphrase, window, cx);
+    match &host.auth {
+      HostAuth::PublicKey {
+        key_path,
+        passphrase_in_keychain,
+      } => {
+        let passphrase = if *passphrase_in_keychain {
+          keychain::fetch(&host.id, keychain::PASSPHRASE)
+        } else {
+          None
+        };
+        let auth = AuthMethod::PublicKey {
+          key_path: key_path.clone(),
+          passphrase,
+        };
+        self.spawn_connect(tab_id, host, auth, window, cx);
+      }
+      HostAuth::Password { in_keychain } => {
+        if *in_keychain {
+          if let Some(pw) = keychain::fetch(&host.id, keychain::PASSWORD) {
+            let auth = AuthMethod::Password { password: pw };
+            self.spawn_connect(tab_id, host, auth, window, cx);
+            return;
+          }
+        }
+        self.prompt_password_then_connect(tab_id, host, window, cx);
+      }
+    }
+  }
+
+  fn prompt_password_then_connect(
+    &mut self,
+    tab_id: u64,
+    host: Host,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let view = cx.entity().downgrade();
+    let host_name = host.name.clone();
+    secret_prompt::open(
+      window,
+      cx,
+      SecretPrompt {
+        title: format!("Password for {host_name}").into(),
+        label: "Password".into(),
+        placeholder: "SSH password".into(),
+        save_label: "Save in Keychain".into(),
+        confirm_label: "Connect".into(),
+      },
+      move |submit, window, cx| {
+        let host = host.clone();
+        let _ = view.update(cx, |this, cx| {
+          if submit.save_in_keychain {
+            match keychain::store(&host.id, keychain::PASSWORD, &submit.secret) {
+              Ok(()) => this.mark_password_saved(&host.id),
+              Err(e) => eprintln!("warning: keychain store for {} failed: {e:#}", host.id),
+            }
+          }
+          let auth = AuthMethod::Password {
+            password: submit.secret,
+          };
+          this.spawn_connect(tab_id, host, auth, window, cx);
+        });
+      },
+    );
   }
 
   fn spawn_connect(
     &mut self,
     tab_id: u64,
     host: Host,
-    passphrase: Option<String>,
+    auth: AuthMethod,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
     let runtime = self.runtime.clone();
     cx.spawn_in(window, async move |this, cx| {
       let host_for_task = host.clone();
-      let pass_for_task = passphrase.clone();
+      let auth_for_task = auth.clone();
       let join = runtime.spawn(async move {
-        let mut cfg = ConnectConfig::new(
+        let cfg = ConnectConfig::new(
           &host_for_task.host,
           host_for_task.port,
           &host_for_task.user,
-          &host_for_task.key_path,
+          auth_for_task,
         );
-        cfg.key_passphrase = pass_for_task;
         let session = Session::connect(&cfg).await?;
         let shell = session.open_shell(INITIAL_COLS, INITIAL_ROWS).await?;
         Ok::<ShellHandle, anyhow::Error>(shell)
@@ -168,22 +225,45 @@ impl Workspace {
           });
         }
         Ok(Err(err)) => {
-          if is_encrypted_key_error(&err) {
+          let is_pubkey = matches!(auth, AuthMethod::PublicKey { .. });
+          if is_pubkey && is_encrypted_key_error(&err) {
             let _ = this.update_in(cx, move |_this, window, cx| {
               let view = cx.entity().downgrade();
               let host_name = host.name.clone();
-              passphrase_prompt::open(window, cx, host_name, move |submit, window, cx| {
-                let host = host.clone();
-                let _ = view.update(cx, |this, cx| {
-                  if submit.save_in_keychain {
-                    match keychain::store(&host.id, &submit.passphrase) {
-                      Ok(()) => this.mark_passphrase_saved(&host.id),
-                      Err(e) => eprintln!("warning: keychain store for {} failed: {e:#}", host.id),
+              let key_path = match &host.auth {
+                HostAuth::PublicKey { key_path, .. } => key_path.clone(),
+                HostAuth::Password { .. } => return,
+              };
+              secret_prompt::open(
+                window,
+                cx,
+                SecretPrompt {
+                  title: format!("Unlock key for {host_name}").into(),
+                  label: "Passphrase".into(),
+                  placeholder: "SSH key passphrase".into(),
+                  save_label: "Save in Keychain".into(),
+                  confirm_label: "Unlock".into(),
+                },
+                move |submit, window, cx| {
+                  let host = host.clone();
+                  let key_path = key_path.clone();
+                  let _ = view.update(cx, |this, cx| {
+                    if submit.save_in_keychain {
+                      match keychain::store(&host.id, keychain::PASSPHRASE, &submit.secret) {
+                        Ok(()) => this.mark_passphrase_saved(&host.id),
+                        Err(e) => {
+                          eprintln!("warning: keychain store for {} failed: {e:#}", host.id);
+                        }
+                      }
                     }
-                  }
-                  this.spawn_connect(tab_id, host, Some(submit.passphrase), window, cx);
-                });
-              });
+                    let auth = AuthMethod::PublicKey {
+                      key_path,
+                      passphrase: Some(submit.secret),
+                    };
+                    this.spawn_connect(tab_id, host, auth, window, cx);
+                  });
+                },
+              );
             });
           } else {
             let msg = format!("{err:#}");
@@ -204,13 +284,41 @@ impl Workspace {
   }
 
   fn mark_passphrase_saved(&mut self, host_id: &str) {
-    if let Some(idx) = self.host_book.hosts().iter().position(|h| h.id == host_id) {
-      let mut host = self.host_book.hosts()[idx].clone();
-      if !host.passphrase_in_keychain {
-        host.passphrase_in_keychain = true;
-        self.host_book.replace(idx, host);
-        self.persist_host_book();
+    self.update_host_in_place(host_id, |host| {
+      if let HostAuth::PublicKey {
+        passphrase_in_keychain,
+        ..
+      } = &mut host.auth
+      {
+        if !*passphrase_in_keychain {
+          *passphrase_in_keychain = true;
+          return true;
+        }
       }
+      false
+    });
+  }
+
+  fn mark_password_saved(&mut self, host_id: &str) {
+    self.update_host_in_place(host_id, |host| {
+      if let HostAuth::Password { in_keychain } = &mut host.auth {
+        if !*in_keychain {
+          *in_keychain = true;
+          return true;
+        }
+      }
+      false
+    });
+  }
+
+  fn update_host_in_place(&mut self, host_id: &str, mutate: impl FnOnce(&mut Host) -> bool) {
+    let Some(idx) = self.host_book.hosts().iter().position(|h| h.id == host_id) else {
+      return;
+    };
+    let mut host = self.host_book.hosts()[idx].clone();
+    if mutate(&mut host) {
+      self.host_book.replace(idx, host);
+      self.persist_host_book();
     }
   }
 
@@ -293,21 +401,14 @@ impl Workspace {
 
   pub(crate) fn add_host_from_dialog(&mut self, input: NewHostInput, cx: &mut Context<Self>) {
     let id = generate_host_id();
-    let mut passphrase_in_keychain = false;
-    if let Some(p) = input.key_passphrase.as_deref() {
-      match keychain::store(&id, p) {
-        Ok(()) => passphrase_in_keychain = true,
-        Err(e) => eprintln!("warning: keychain store for {id} failed: {e:#}"),
-      }
-    }
+    let auth = build_host_auth(&id, input.auth, &HostAuth::Password { in_keychain: false });
     let host = Host {
       id,
       name: input.name,
       host: input.host,
       port: input.port,
       user: input.user,
-      key_path: input.key_path,
-      passphrase_in_keychain,
+      auth,
     };
     self.host_book.add(host);
     self.persist_host_book();
@@ -323,23 +424,16 @@ impl Workspace {
     let Some(idx) = self.host_book.hosts().iter().position(|h| h.id == host_id) else {
       return;
     };
-    let existing = &self.host_book.hosts()[idx];
-    let id = existing.id.clone();
-    let mut passphrase_in_keychain = existing.passphrase_in_keychain;
-    if let Some(p) = input.key_passphrase.as_deref() {
-      match keychain::store(&id, p) {
-        Ok(()) => passphrase_in_keychain = true,
-        Err(e) => eprintln!("warning: keychain store for {id} failed: {e:#}"),
-      }
-    }
+    let existing = self.host_book.hosts()[idx].clone();
+    purge_obsolete_keychain_entries(&existing.auth, &input.auth, &existing.id);
+    let auth = build_host_auth(&existing.id, input.auth, &existing.auth);
     let host = Host {
-      id,
+      id: existing.id,
       name: input.name,
       host: input.host,
       port: input.port,
       user: input.user,
-      key_path: input.key_path,
-      passphrase_in_keychain,
+      auth,
     };
     self.host_book.replace(idx, host);
     self.persist_host_book();
@@ -350,7 +444,8 @@ impl Workspace {
     let Some(idx) = self.host_book.hosts().iter().position(|h| h.id == host_id) else {
       return;
     };
-    keychain::delete(host_id);
+    keychain::delete(host_id, keychain::PASSPHRASE);
+    keychain::delete(host_id, keychain::PASSWORD);
     self.host_book.remove(idx);
     self.persist_host_book();
     cx.notify();
@@ -367,13 +462,21 @@ impl Workspace {
     let Some(host) = self.host_book.hosts().iter().find(|h| h.id == host_id) else {
       return;
     };
+    let auth = match &host.auth {
+      HostAuth::PublicKey { key_path, .. } => NewAuth::PublicKey {
+        key_path: key_path.clone(),
+        passphrase: None,
+      },
+      HostAuth::Password { .. } => NewAuth::Password {
+        password: String::new(),
+      },
+    };
     let initial = NewHostInput {
       name: host.name.clone(),
       host: host.host.clone(),
       port: host.port,
       user: host.user.clone(),
-      key_path: host.key_path.clone(),
-      key_passphrase: None,
+      auth,
     };
     let view = cx.entity().downgrade();
     add_host_dialog::open(window, cx, Some(initial), move |input, cx| {
@@ -638,6 +741,61 @@ fn is_encrypted_key_error(err: &anyhow::Error) -> bool {
   err
     .chain()
     .any(|cause| cause.to_string().contains("The key is encrypted"))
+}
+
+/// Build the persisted `HostAuth` from a dialog submission, writing any
+/// freshly-supplied secrets to the keychain. Falls back to the previous
+/// auth's `*_in_keychain` flag when the user kept the same auth mode and
+/// did not retype the secret.
+fn build_host_auth(host_id: &str, input: NewAuth, previous: &HostAuth) -> HostAuth {
+  match input {
+    NewAuth::PublicKey {
+      key_path,
+      passphrase,
+    } => {
+      let mut passphrase_in_keychain = matches!(
+        previous,
+        HostAuth::PublicKey {
+          passphrase_in_keychain: true,
+          ..
+        }
+      );
+      if let Some(p) = passphrase.as_deref() {
+        match keychain::store(host_id, keychain::PASSPHRASE, p) {
+          Ok(()) => passphrase_in_keychain = true,
+          Err(e) => eprintln!("warning: keychain store for {host_id} failed: {e:#}"),
+        }
+      }
+      HostAuth::PublicKey {
+        key_path,
+        passphrase_in_keychain,
+      }
+    }
+    NewAuth::Password { password } => {
+      let mut in_keychain = matches!(previous, HostAuth::Password { in_keychain: true });
+      match keychain::store(host_id, keychain::PASSWORD, &password) {
+        Ok(()) => in_keychain = true,
+        Err(e) => eprintln!("warning: keychain store for {host_id} failed: {e:#}"),
+      }
+      HostAuth::Password { in_keychain }
+    }
+  }
+}
+
+/// When the user switches auth modes on edit, drop the now-unused secret
+/// from the keychain so we don't leak it. Same-mode edits leave the
+/// existing entry alone (it will be overwritten by [`build_host_auth`] if
+/// the user retyped the secret).
+fn purge_obsolete_keychain_entries(prev: &HostAuth, new: &NewAuth, host_id: &str) {
+  match (prev, new) {
+    (HostAuth::PublicKey { .. }, NewAuth::Password { .. }) => {
+      keychain::delete(host_id, keychain::PASSPHRASE);
+    }
+    (HostAuth::Password { .. }, NewAuth::PublicKey { .. }) => {
+      keychain::delete(host_id, keychain::PASSWORD);
+    }
+    _ => {}
+  }
 }
 
 /// Generate a stable-enough host ID from the wall clock

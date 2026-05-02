@@ -4,7 +4,7 @@ use std::sync::Arc;
 mod app_root;
 
 use app_root::AppRoot;
-use elum_workspace::{Host, HostBook, Workspace};
+use elum_workspace::{Host, HostAuth, HostBook, Workspace};
 use gpui::{px, size, App, AppContext, Bounds, WindowBounds, WindowOptions};
 
 const INITIAL_WIDTH_PX: f32 = 900.0;
@@ -88,7 +88,9 @@ fn default_docker_host() -> Host {
     host: "127.0.0.1".into(),
     port: 2222,
     user: "testuser".into(),
-    key_path,
-    passphrase_in_keychain: false,
+    auth: HostAuth::PublicKey {
+      key_path,
+      passphrase_in_keychain: false,
+    },
   }
 }

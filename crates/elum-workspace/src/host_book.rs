@@ -13,16 +13,15 @@
 //!       "host": "127.0.0.1",
 //!       "port": 2222,
 //!       "user": "testuser",
-//!       "key_path": "/abs/path/to/id_ed25519",
-//!       "passphrase_in_keychain": false
+//!       "auth": {
+//!         "type": "public_key",
+//!         "key_path": "/abs/path/to/id_ed25519",
+//!         "passphrase_in_keychain": false
+//!       }
 //!     }
 //!   ]
 //! }
 //! ```
-//!
-//! Passphrases are never written to this file. When `passphrase_in_keychain`
-//! is `true`, the actual secret lives in the OS keychain under service
-//! `com.elum.host.{id}` / account `passphrase`.
 
 use std::fs;
 use std::io;
@@ -32,15 +31,27 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HostAuth {
+  PublicKey {
+    key_path: PathBuf,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    passphrase_in_keychain: bool,
+  },
+  Password {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    in_keychain: bool,
+  },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Host {
   pub id: String,
   pub name: String,
   pub host: String,
   pub port: u16,
   pub user: String,
-  pub key_path: PathBuf,
-  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-  pub passphrase_in_keychain: bool,
+  pub auth: HostAuth,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,8 +171,10 @@ mod tests {
       host: "127.0.0.1".into(),
       port: 22,
       user: "user".into(),
-      key_path: PathBuf::from("/dev/null"),
-      passphrase_in_keychain: false,
+      auth: HostAuth::PublicKey {
+        key_path: PathBuf::from("/dev/null"),
+        passphrase_in_keychain: false,
+      },
     }
   }
 

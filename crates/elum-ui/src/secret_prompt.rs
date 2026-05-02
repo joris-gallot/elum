@@ -11,42 +11,52 @@ use gpui_component::{
   WindowExt as _,
 };
 
-pub struct PassphraseSubmit {
-  pub passphrase: String,
+pub struct SecretPrompt {
+  pub title: SharedString,
+  pub label: SharedString,
+  pub placeholder: SharedString,
+  pub save_label: SharedString,
+  pub confirm_label: SharedString,
+}
+
+pub struct SecretSubmit {
+  pub secret: String,
   pub save_in_keychain: bool,
 }
 
-pub fn open<F>(window: &mut Window, cx: &mut App, host_name: String, on_submit: F)
+pub fn open<F>(window: &mut Window, cx: &mut App, prompt: SecretPrompt, on_submit: F)
 where
-  F: Fn(PassphraseSubmit, &mut Window, &mut App) + 'static,
+  F: Fn(SecretSubmit, &mut Window, &mut App) + 'static,
 {
   let on_submit = Rc::new(on_submit);
   let save = Rc::new(Cell::new(true));
 
-  let passphrase = cx.new(|cx| {
+  let placeholder = prompt.placeholder.clone();
+  let secret = cx.new(|cx| {
     InputState::new(window, cx)
       .masked(true)
-      .placeholder("SSH key passphrase")
+      .placeholder(placeholder.clone())
   });
 
-  let title = SharedString::from(format!("Unlock key for {host_name}"));
-
   window.open_dialog(cx, move |dialog, _, _| {
-    let passphrase = passphrase.clone();
+    let secret = secret.clone();
     let save = save.clone();
     let on_submit = on_submit.clone();
+    let label = prompt.label.clone();
+    let save_label = prompt.save_label.clone();
+    let confirm_label = prompt.confirm_label.clone();
 
     let body = v_form()
       .child(
         field()
-          .label("Passphrase")
+          .label(label)
           .required(true)
-          .child(Input::new(&passphrase)),
+          .child(Input::new(&secret)),
       )
       .child(
         field().child(
           Checkbox::new("save-in-keychain")
-            .label("Save in Keychain")
+            .label(save_label)
             .checked(save.get())
             .on_click({
               let save = save.clone();
@@ -57,22 +67,22 @@ where
 
     dialog
       .w(px(400.))
-      .title(title.clone())
+      .title(prompt.title.clone())
       .child(body)
       .footer(
         DialogFooter::new()
           .gap_2()
           .child(DialogClose::new().child(Button::new("cancel").outline().label("Cancel")))
-          .child(DialogAction::new().child(Button::new("unlock").primary().label("Unlock"))),
+          .child(DialogAction::new().child(Button::new("ok").primary().label(confirm_label))),
       )
       .on_ok(move |_, window, cx| {
-        let value = read_value(&passphrase, cx);
+        let value = read_value(&secret, cx);
         if value.is_empty() {
           return false;
         }
         on_submit(
-          PassphraseSubmit {
-            passphrase: value,
+          SecretSubmit {
+            secret: value,
             save_in_keychain: save.get(),
           },
           window,

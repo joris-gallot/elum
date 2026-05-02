@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -7,8 +8,20 @@ use gpui_component::{
   dialog::{DialogAction, DialogClose, DialogFooter},
   form::{field, v_form},
   input::{Input, InputState},
+  tab::{Tab, TabBar},
   WindowExt as _,
 };
+
+#[derive(Debug, Clone)]
+pub enum NewAuth {
+  PublicKey {
+    key_path: PathBuf,
+    passphrase: Option<String>,
+  },
+  Password {
+    password: String,
+  },
+}
 
 #[derive(Debug, Clone)]
 pub struct NewHostInput {
@@ -16,9 +29,11 @@ pub struct NewHostInput {
   pub host: String,
   pub port: u16,
   pub user: String,
-  pub key_path: PathBuf,
-  pub key_passphrase: Option<String>,
+  pub auth: NewAuth,
 }
+
+const MODE_KEY: usize = 0;
+const MODE_PASSWORD: usize = 1;
 
 pub fn open<F>(window: &mut Window, cx: &mut App, initial: Option<NewHostInput>, on_submit: F)
 where
@@ -35,10 +50,17 @@ where
     .as_ref()
     .map_or_else(|| "22".to_string(), |i| i.port.to_string());
   let user_default = initial.as_ref().map(|i| i.user.clone());
-  let key_default = initial
-    .as_ref()
-    .map(|i| i.key_path.to_string_lossy().to_string());
-  let passphrase_default = initial.as_ref().and_then(|i| i.key_passphrase.clone());
+
+  let initial_mode = match initial.as_ref().map(|i| &i.auth) {
+    Some(NewAuth::Password { .. }) => MODE_PASSWORD,
+    _ => MODE_KEY,
+  };
+  let key_default = initial.as_ref().and_then(|i| match &i.auth {
+    NewAuth::PublicKey { key_path, .. } => Some(key_path.to_string_lossy().to_string()),
+    NewAuth::Password { .. } => None,
+  });
+
+  let mode = Rc::new(Cell::new(initial_mode));
 
   let name = cx.new(|cx| {
     let s = InputState::new(window, cx).placeholder("My VPS");
@@ -75,14 +97,15 @@ where
   });
 
   let passphrase = cx.new(|cx| {
-    let s = InputState::new(window, cx)
+    InputState::new(window, cx)
       .masked(true)
-      .placeholder("Leave empty if key is unencrypted");
-    if let Some(v) = passphrase_default {
-      s.default_value(v)
-    } else {
-      s
-    }
+      .placeholder("Leave empty if key is unencrypted")
+  });
+
+  let password = cx.new(|cx| {
+    InputState::new(window, cx)
+      .masked(true)
+      .placeholder("SSH password")
   });
 
   window.open_dialog(cx, move |dialog, _, _| {
@@ -92,9 +115,24 @@ where
     let user = user.clone();
     let key = key.clone();
     let passphrase = passphrase.clone();
+    let password = password.clone();
+    let mode = mode.clone();
     let on_submit = on_submit.clone();
 
-    let body = v_form()
+    let auth_tabs = TabBar::new("auth-mode")
+      .segmented()
+      .selected_index(mode.get())
+      .child(Tab::new().label("Key"))
+      .child(Tab::new().label("Password"))
+      .on_click({
+        let mode = mode.clone();
+        move |ix, window, _| {
+          mode.set(*ix);
+          window.refresh();
+        }
+      });
+
+    let mut form = v_form()
       .child(
         field()
           .label("Name")
@@ -119,22 +157,34 @@ where
           .required(true)
           .child(Input::new(&user)),
       )
-      .child(
+      .child(field().label("Authentication").child(auth_tabs));
+
+    if mode.get() == MODE_PASSWORD {
+      form = form.child(
         field()
-          .label("Key path")
+          .label("Password")
           .required(true)
-          .child(Input::new(&key)),
-      )
-      .child(
-        field()
-          .label("Key passphrase")
-          .child(Input::new(&passphrase)),
+          .child(Input::new(&password)),
       );
+    } else {
+      form = form
+        .child(
+          field()
+            .label("Key path")
+            .required(true)
+            .child(Input::new(&key)),
+        )
+        .child(
+          field()
+            .label("Key passphrase")
+            .child(Input::new(&passphrase)),
+        );
+    }
 
     dialog
       .w(px(440.))
       .title(title)
-      .child(body)
+      .child(form)
       .footer(
         DialogFooter::new()
           .gap_2()
@@ -149,24 +199,34 @@ where
           _ => return false,
         };
         let user_v = read_value(&user, cx);
-        let key_v = read_value(&key, cx);
-        let passphrase_v = read_value(&passphrase, cx);
-
-        if name_v.is_empty() || host_v.is_empty() || user_v.is_empty() || key_v.is_empty() {
+        if name_v.is_empty() || host_v.is_empty() || user_v.is_empty() {
           return false;
         }
+
+        let auth = if mode.get() == MODE_PASSWORD {
+          let pw = read_value(&password, cx);
+          if pw.is_empty() {
+            return false;
+          }
+          NewAuth::Password { password: pw }
+        } else {
+          let key_v = read_value(&key, cx);
+          if key_v.is_empty() {
+            return false;
+          }
+          let pp = read_value(&passphrase, cx);
+          NewAuth::PublicKey {
+            key_path: PathBuf::from(key_v),
+            passphrase: if pp.is_empty() { None } else { Some(pp) },
+          }
+        };
 
         let input = NewHostInput {
           name: name_v,
           host: host_v,
           port: port_v,
           user: user_v,
-          key_path: PathBuf::from(key_v),
-          key_passphrase: if passphrase_v.is_empty() {
-            None
-          } else {
-            Some(passphrase_v)
-          },
+          auth,
         };
         on_submit(input, cx);
         true
