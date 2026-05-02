@@ -617,6 +617,7 @@ impl Workspace {
         .icon(UiIconName::X)
         .ghost()
         .xsmall()
+        .mr_1()
         .on_click(cx.listener(move |this, _, window, cx| {
           this.close_tab_at(i, window, cx);
         }));
@@ -786,9 +787,7 @@ fn build_host_auth(host_id: &str, input: NewAuth, previous: &HostAuth) -> HostAu
 }
 
 /// When the user switches auth modes on edit, drop the now-unused secret
-/// from the keychain so we don't leak it. Same-mode edits leave the
-/// existing entry alone (it will be overwritten by [`build_host_auth`] if
-/// the user retyped the secret).
+/// from the keychain. Same-mode edits leave the existing entry alone
 fn purge_obsolete_keychain_entries(prev: &HostAuth, new: &NewAuth, host_id: &str) {
   match (prev, new) {
     (HostAuth::PublicKey { .. }, NewAuth::Password { .. }) => {

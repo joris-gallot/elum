@@ -1,7 +1,7 @@
 use anyhow::Result;
 use keyring::{Entry, Error};
 
-const SERVICE_PREFIX: &str = "com.elum.host.";
+const SERVICE_PREFIX: &str = "elum.host.";
 
 pub const PASSPHRASE: &str = "passphrase";
 pub const PASSWORD: &str = "password";
