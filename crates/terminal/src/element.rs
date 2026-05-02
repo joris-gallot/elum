@@ -160,76 +160,43 @@ impl Element for TerminalElement {
     window: &mut Window,
     cx: &mut App,
   ) {
-    let bg_default = default_background();
-    let fg_default = default_foreground();
-    let cursor_bg = cursor_color();
-    let sel_bg = selection_color();
+    let snapshot = &prepaint.snapshot;
+    let cursor_kind = resolve_cursor_kind(snapshot, self.focused, self.blink_phase);
+    let ctx = PaintCtx {
+      origin: prepaint.origin,
+      cell_w: prepaint.cell_width,
+      line_h: prepaint.line_height,
+      font_size: prepaint.font_size,
+      cursor: snapshot.cursor,
+      cursor_filled: cursor_kind == CursorKind::Filled,
+      selection: snapshot.selection,
+      display_offset: snapshot.display_offset,
+      fg_default: default_foreground(),
+      bg_default: default_background(),
+      cursor_bg: cursor_color(),
+      sel_bg: selection_color(),
+      text_style: &prepaint.text_style,
+    };
 
     // Window background - cells without explicit bg paint over this.
-    window.paint_quad(fill(bounds, bg_default));
-
-    let cell_w = prepaint.cell_width;
-    let line_h = prepaint.line_height;
-    let origin = prepaint.origin;
-    let snapshot = &prepaint.snapshot;
-    let selection = snapshot.selection;
-    let display_offset = snapshot.display_offset;
-
-    let cursor_kind = resolve_cursor_kind(snapshot, self.focused, self.blink_phase);
+    window.paint_quad(fill(bounds, ctx.bg_default));
 
     // Pass 1: background quads. We coalesce horizontally adjacent cells
     // with the same effective bg into a single quad; reduces draw calls
     // and avoids hairlines between identical neighbors. Filled cursor
     // is rendered as bg here so adjacent same-bg cells coalesce.
     for (row_idx, row) in snapshot.rows.iter().enumerate() {
-      paint_row_backgrounds(
-        row,
-        row_idx,
-        snapshot.cursor,
-        cursor_kind == CursorKind::Filled,
-        selection,
-        display_offset,
-        origin,
-        cell_w,
-        line_h,
-        fg_default,
-        bg_default,
-        cursor_bg,
-        sel_bg,
-        window,
-      );
+      paint_row_backgrounds(&ctx, row_idx, row, window);
     }
 
     // Pass 2: shape and paint the row text. One `shape_line` per row,
     // with adjacent same-style cells coalesced into shared TextRuns.
     for (row_idx, row) in snapshot.rows.iter().enumerate() {
-      paint_row_text(
-        row,
-        row_idx,
-        snapshot.cursor,
-        cursor_kind == CursorKind::Filled,
-        origin,
-        cell_w,
-        line_h,
-        prepaint.font_size,
-        &prepaint.text_style,
-        fg_default,
-        bg_default,
-        window,
-        cx,
-      );
+      paint_row_text(&ctx, row_idx, row, window, cx);
     }
 
     // Pass 3: non-filled cursor decorations (hollow border, beam, underline).
-    paint_cursor_overlay(
-      cursor_kind,
-      snapshot.cursor,
-      origin,
-      cell_w,
-      line_h,
-      cursor_bg,
-      window,
-    );
+    paint_cursor_overlay(cursor_kind, &ctx, window);
 
     self.register_mouse_listeners(prepaint.hitbox.clone(), window);
   }
@@ -323,6 +290,22 @@ enum CursorKind {
   Beam,
 }
 
+struct PaintCtx<'a> {
+  origin: Point<Pixels>,
+  cell_w: Pixels,
+  line_h: Pixels,
+  font_size: Pixels,
+  cursor: (usize, usize),
+  cursor_filled: bool,
+  selection: Option<alacritty_terminal::selection::SelectionRange>,
+  display_offset: usize,
+  fg_default: Rgba,
+  bg_default: Rgba,
+  cursor_bg: Rgba,
+  sel_bg: Rgba,
+  text_style: &'a TextStyle,
+}
+
 fn resolve_cursor_kind(snapshot: &GridSnapshot, focused: bool, blink_phase: bool) -> CursorKind {
   if !snapshot.cursor_visible {
     return CursorKind::None;
@@ -345,22 +328,17 @@ fn resolve_cursor_kind(snapshot: &GridSnapshot, focused: bool, blink_phase: bool
 }
 
 /// Paint the cursor overlay for non-`Filled` kinds
-fn paint_cursor_overlay(
-  kind: CursorKind,
-  cursor: (usize, usize),
-  origin: Point<Pixels>,
-  cell_w: Pixels,
-  line_h: Pixels,
-  color: Rgba,
-  window: &mut Window,
-) {
+fn paint_cursor_overlay(kind: CursorKind, ctx: &PaintCtx<'_>, window: &mut Window) {
   if matches!(kind, CursorKind::None | CursorKind::Filled) {
     return;
   }
-  let (row, col) = cursor;
+  let (row, col) = ctx.cursor;
+  let color = ctx.cursor_bg;
+  let cell_w = ctx.cell_w;
+  let line_h = ctx.line_h;
   let cell_origin = point(
-    origin.x + cell_w * col as f32,
-    origin.y + line_h * row as f32,
+    ctx.origin.x + cell_w * col as f32,
+    ctx.origin.y + line_h * row as f32,
   );
   match kind {
     CursorKind::Hollow => {
@@ -400,33 +378,22 @@ fn paint_cursor_overlay(
   }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn paint_row_backgrounds(
-  row: &[CellSnapshot],
+  ctx: &PaintCtx<'_>,
   row_idx: usize,
-  cursor: (usize, usize),
-  cursor_filled: bool,
-  selection: Option<alacritty_terminal::selection::SelectionRange>,
-  display_offset: usize,
-  origin: Point<Pixels>,
-  cell_w: Pixels,
-  line_h: Pixels,
-  fg_default: Rgba,
-  bg_default: Rgba,
-  cursor_bg: Rgba,
-  sel_bg: Rgba,
+  row: &[CellSnapshot],
   window: &mut Window,
 ) {
-  let y = origin.y + line_h * row_idx as f32;
-  let grid_line = Line(row_idx as i32 - display_offset as i32);
+  let y = ctx.origin.y + ctx.line_h * row_idx as f32;
+  let grid_line = Line(row_idx as i32 - ctx.display_offset as i32);
 
   let mut run_start: Option<usize> = None;
-  let mut run_color: Rgba = bg_default;
+  let mut run_color: Rgba = ctx.bg_default;
 
   for (col, cell) in row.iter().enumerate() {
-    let bg = effective_bg(cell, fg_default, bg_default);
-    let is_cursor = cursor_filled && cursor == (row_idx, col);
-    let is_selected = selection.is_some_and(|range| {
+    let bg = effective_bg(cell, ctx.fg_default, ctx.bg_default);
+    let is_cursor = ctx.cursor_filled && ctx.cursor == (row_idx, col);
+    let is_selected = ctx.selection.is_some_and(|range| {
       let here = range.contains(AlacPoint::new(grid_line, Column(col)));
       // Wide-char trailing spacers should highlight together with the
       // left half: alacritty's range only covers the left cell, so we
@@ -438,9 +405,9 @@ fn paint_row_backgrounds(
     // Selection wins over cursor: the user is highlighting this cell,
     // not editing at it. Cursor wins over the cell's own bg.
     let final_bg = if is_selected {
-      sel_bg
+      ctx.sel_bg
     } else if is_cursor {
-      cursor_bg
+      ctx.cursor_bg
     } else {
       bg
     };
@@ -450,8 +417,8 @@ fn paint_row_backgrounds(
         // continue current run
       }
       Some(start) => {
-        if run_color != bg_default {
-          flush_bg_run(run_color, start, col, y, origin, cell_w, line_h, window);
+        if run_color != ctx.bg_default {
+          flush_bg_run(ctx, run_color, start, col, y, window);
         }
         run_start = Some(col);
         run_color = final_bg;
@@ -464,51 +431,30 @@ fn paint_row_backgrounds(
   }
 
   if let Some(start) = run_start {
-    if run_color != bg_default {
-      flush_bg_run(
-        run_color,
-        start,
-        row.len(),
-        y,
-        origin,
-        cell_w,
-        line_h,
-        window,
-      );
+    if run_color != ctx.bg_default {
+      flush_bg_run(ctx, run_color, start, row.len(), y, window);
     }
   }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn flush_bg_run(
+  ctx: &PaintCtx<'_>,
   color: Rgba,
   start_col: usize,
   end_col: usize,
   y: Pixels,
-  origin: Point<Pixels>,
-  cell_w: Pixels,
-  line_h: Pixels,
   window: &mut Window,
 ) {
-  let x = origin.x + cell_w * start_col as f32;
-  let span = cell_w * (end_col - start_col) as f32;
-  let bounds = Bounds::new(point(x, y), size(span, line_h));
+  let x = ctx.origin.x + ctx.cell_w * start_col as f32;
+  let span = ctx.cell_w * (end_col - start_col) as f32;
+  let bounds = Bounds::new(point(x, y), size(span, ctx.line_h));
   window.paint_quad(fill(bounds, color));
 }
 
-#[allow(clippy::too_many_arguments)]
 fn paint_row_text(
-  row: &[CellSnapshot],
+  ctx: &PaintCtx<'_>,
   row_idx: usize,
-  cursor: (usize, usize),
-  cursor_filled: bool,
-  origin: Point<Pixels>,
-  cell_w: Pixels,
-  line_h: Pixels,
-  font_size: Pixels,
-  text_style: &TextStyle,
-  fg_default: Rgba,
-  bg_default: Rgba,
+  row: &[CellSnapshot],
   window: &mut Window,
   cx: &mut App,
 ) {
@@ -525,15 +471,21 @@ fn paint_row_text(
     let glyph_str: SharedString = glyph.to_string().into();
     let glyph_byte_len = glyph_str.len();
 
-    let is_cursor = cursor_filled && cursor == (row_idx, col);
-    let style = row_run_style(cell, is_cursor, text_style, fg_default, bg_default);
+    let is_cursor = ctx.cursor_filled && ctx.cursor == (row_idx, col);
+    let style = row_run_style(
+      cell,
+      is_cursor,
+      ctx.text_style,
+      ctx.fg_default,
+      ctx.bg_default,
+    );
 
     match &current_style {
       Some(s) if s == &style => {
         current_len += glyph_byte_len;
       }
       Some(s) => {
-        runs.push(s.to_text_run(current_len, text_style));
+        runs.push(s.to_text_run(current_len, ctx.text_style));
         current_style = Some(style);
         current_len = glyph_byte_len;
       }
@@ -546,20 +498,22 @@ fn paint_row_text(
   }
 
   if let Some(s) = current_style.take() {
-    runs.push(s.to_text_run(current_len, text_style));
+    runs.push(s.to_text_run(current_len, ctx.text_style));
   }
 
   if text.is_empty() {
     return;
   }
 
-  let row_origin = point(origin.x, origin.y + line_h * row_idx as f32);
-  let shaped_line =
-    window
-      .text_system()
-      .shape_line(SharedString::from(text), font_size, &runs, Some(cell_w));
+  let row_origin = point(ctx.origin.x, ctx.origin.y + ctx.line_h * row_idx as f32);
+  let shaped_line = window.text_system().shape_line(
+    SharedString::from(text),
+    ctx.font_size,
+    &runs,
+    Some(ctx.cell_w),
+  );
 
-  let _ = shaped_line.paint(row_origin, line_h, TextAlign::Left, None, window, cx);
+  let _ = shaped_line.paint(row_origin, ctx.line_h, TextAlign::Left, None, window, cx);
 }
 
 /// Effective background for a cell, accounting for `inverse`. Cursor
