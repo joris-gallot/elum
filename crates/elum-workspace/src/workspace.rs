@@ -527,8 +527,8 @@ impl Workspace {
   fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
     use gpui_component::{
       button::{Button, ButtonVariants as _},
-      sidebar::{Sidebar, SidebarHeader, SidebarMenu, SidebarMenuItem},
-      ActiveTheme as _, IconName as ComponentIconName, Sizable as _,
+      sidebar::{Sidebar, SidebarMenu, SidebarMenuItem},
+      ActiveTheme as _, IconName as ComponentIconName, Sizable as _, StyledExt as _,
     };
 
     let view = cx.entity().downgrade();
@@ -550,9 +550,12 @@ impl Workspace {
         }
       });
 
-    // SidebarHeader composes children horizontally; flex_1 on the label
-    // pushes the `+` button to the far right.
-    let header = SidebarHeader::new()
+    let header = div()
+      .h_flex()
+      .gap_2()
+      .p_2()
+      .w_full()
+      .justify_between()
       .child(
         div()
           .flex_1()
