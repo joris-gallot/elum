@@ -8,6 +8,11 @@ use gpui::{
   actions, div, px, relative, Action, AnyElement, App, AppContext, Context, Entity, FocusHandle,
   Focusable, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled, Window,
 };
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::resizable::{h_resizable, resizable_panel};
+use gpui_component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
+use gpui_component::tab::{Tab as ComponentTab, TabBar};
+use gpui_component::{ActiveTheme, Sizable, StyledExt, TitleBar};
 use serde::Deserialize;
 use tokio::runtime::Runtime;
 
@@ -525,16 +530,11 @@ impl Workspace {
   }
 
   fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
-    use gpui_component::{
-      button::{Button, ButtonVariants as _},
-      sidebar::{Sidebar, SidebarMenu, SidebarMenuItem},
-      ActiveTheme as _, IconName as ComponentIconName, Sizable as _, StyledExt as _,
-    };
-
     let view = cx.entity().downgrade();
+    let theme = cx.theme();
 
     let add_button = Button::new("add-host")
-      .icon(ComponentIconName::Plus)
+      .icon(UiIconName::Plus)
       .ghost()
       .small()
       .tooltip("Add host")
@@ -559,8 +559,8 @@ impl Workspace {
       .child(
         div()
           .flex_1()
-          .text_color(cx.theme().muted_foreground)
-          .child(SharedString::from("Hosts")),
+          .text_color(theme.muted_foreground)
+          .child("Hosts"),
       )
       .child(add_button);
 
@@ -590,16 +590,11 @@ impl Workspace {
       .border_0()
       .header(header)
       .child(menu)
+      .bg(theme.sidebar)
       .into_any_element()
   }
 
   fn render_tab_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-    use gpui_component::{
-      button::{Button, ButtonVariants as _},
-      tab::{Tab, TabBar},
-      Sizable as _,
-    };
-
     if self.tabs.is_empty() {
       // Empty bar still gets rendered (for height stability) but with no tabs inside.
       return div().h(px(TAB_BAR_HEIGHT_PX)).into_any_element();
@@ -623,7 +618,7 @@ impl Workspace {
         }));
 
       bar = bar.child(
-        Tab::new()
+        ComponentTab::new()
           .label(SharedString::from(tab.host.name.clone()))
           .suffix(close_button),
       );
@@ -633,8 +628,6 @@ impl Workspace {
   }
 
   fn render_active_body(&self, cx: &mut Context<Self>) -> AnyElement {
-    use gpui_component::ActiveTheme as _;
-
     let theme = cx.theme();
     let muted_fg = theme.muted_foreground;
     let danger = theme.danger;
@@ -649,9 +642,11 @@ impl Workspace {
         .child("Click a host in the sidebar to connect.")
         .into_any_element();
     };
+
     let Some(tab) = self.tabs.get(idx) else {
       return div().flex_1().into_any_element();
     };
+
     match &tab.state {
       TabState::Connecting => div()
         .flex()
@@ -695,14 +690,9 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
   fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-    use gpui_component::{
-      resizable::{h_resizable, resizable_panel},
-      ActiveTheme as _, TitleBar,
-    };
-
-    let theme = cx.theme();
-    let background = theme.background;
-    let foreground = theme.foreground;
+    let bg = cx.theme().accent;
+    let fg = cx.theme().foreground;
+    let titlebar_bg = cx.theme().sidebar;
 
     let main = div()
       .flex()
@@ -725,9 +715,9 @@ impl Render for Workspace {
       .flex()
       .flex_col()
       .size_full()
-      .bg(background)
-      .text_color(foreground)
-      .child(TitleBar::new())
+      .bg(bg)
+      .text_color(fg)
+      .child(TitleBar::new().bg(titlebar_bg))
       .child(
         h_resizable("workspace-split")
           .child(

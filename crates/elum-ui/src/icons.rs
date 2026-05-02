@@ -14,12 +14,14 @@ use gpui_component::IconNamed;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiIconName {
   X,
+  Plus,
 }
 
 impl IconNamed for UiIconName {
   fn path(self) -> SharedString {
     match self {
       Self::X => "icons/x.svg".into(),
+      Self::Plus => "icons/plus.svg".into(),
     }
   }
 }
