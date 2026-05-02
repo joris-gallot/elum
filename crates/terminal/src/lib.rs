@@ -221,29 +221,6 @@ impl Terminal {
     })
   }
 
-  pub fn cursor_blinking(&self) -> bool {
-    self.with_term(|term| term.cursor_style().blinking)
-  }
-
-  /// Snapshot the visible grid as one `String` per row. Trailing whitespace
-  /// is stripped per line. Used by debug/log paths; the styled view uses
-  /// [`Terminal::snapshot_grid`] instead.
-  pub fn snapshot_lines(&self) -> Vec<String> {
-    self.with_term(|term| {
-      let cols = term.columns();
-      let rows = term.screen_lines();
-      (0..rows)
-        .map(|row| {
-          (0..cols)
-            .map(|col| term.grid()[AlacPoint::new(Line(row as i32), Column(col))].c)
-            .collect::<String>()
-            .trim_end()
-            .to_string()
-        })
-        .collect()
-    })
-  }
-
   /// Snapshot every visible cell with its style flags, plus the cursor
   /// position, visibility, shape, and DECSCUSR blink request. Honors the
   /// current scroll offset: if the user has scrolled into history, the

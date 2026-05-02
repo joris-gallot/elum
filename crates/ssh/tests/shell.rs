@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ssh::{ConnectConfig, Session};
+use ssh::{AuthMethod, ConnectConfig, Session};
 use tokio::time::timeout;
 
 fn test_key_path() -> PathBuf {
@@ -21,7 +21,15 @@ fn test_key_path() -> PathBuf {
 }
 
 fn test_config() -> ConnectConfig {
-  ConnectConfig::with_public_key("127.0.0.1", 2222, "testuser", test_key_path())
+  ConnectConfig::new(
+    "127.0.0.1",
+    2222,
+    "testuser",
+    AuthMethod::PublicKey {
+      key_path: test_key_path(),
+      passphrase: None,
+    },
+  )
 }
 
 /// Drain bytes from the shell until `needle` appears or the deadline elapses.

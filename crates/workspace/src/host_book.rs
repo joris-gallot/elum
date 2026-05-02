@@ -68,7 +68,6 @@ pub struct HostBook {
   hosts: Vec<Host>,
 }
 
-#[allow(dead_code)]
 impl HostBook {
   /// Standard location: `~/Library/Application Support/elum/hosts.json` on
   /// macOS, `$XDG_CONFIG_HOME/elum/hosts.json` on Linux. Falls back to a
@@ -108,16 +107,8 @@ impl HostBook {
     }
   }
 
-  pub fn load_default() -> Result<Self> {
-    Self::load_from(Self::default_path())
-  }
-
   pub fn hosts(&self) -> &[Host] {
     &self.hosts
-  }
-
-  pub fn path(&self) -> &Path {
-    &self.path
   }
 
   pub fn is_empty(&self) -> bool {
@@ -184,7 +175,6 @@ mod tests {
     let path = dir.path().join("hosts.json");
     let book = HostBook::load_from(&path).expect("load");
     assert!(book.is_empty());
-    assert_eq!(book.path(), path);
   }
 
   #[test]

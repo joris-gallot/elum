@@ -7,7 +7,6 @@
 //! No host-key verification policy yet, `accept_any_host_key` is hard-wired
 //! to `true` in tests. Real builds will gate this on a `KnownHosts` store.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context as _, Result};
@@ -68,23 +67,6 @@ impl ConnectConfig {
       auth,
       accept_any_host_key: true,
     }
-  }
-
-  pub fn with_public_key(
-    host: impl Into<String>,
-    port: u16,
-    user: impl Into<String>,
-    key_path: impl AsRef<Path>,
-  ) -> Self {
-    Self::new(
-      host,
-      port,
-      user,
-      AuthMethod::PublicKey {
-        key_path: key_path.as_ref().to_path_buf(),
-        passphrase: None,
-      },
-    )
   }
 }
 
