@@ -592,6 +592,7 @@ impl Workspace {
         let view_for_click = view.clone();
         let host_id = SharedString::from(host.id.clone());
         SidebarMenuItem::new(SharedString::from(host.name.clone()))
+          .icon(UiIconName::Server)
           .on_click(move |_, window, cx| {
             let _ = view_for_click.update(cx, |this, cx| {
               this.connect_to_host(i, window, cx);

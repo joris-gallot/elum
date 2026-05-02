@@ -1,9 +1,3 @@
-//! Type-safe icon set for the Elum UI.
-//!
-//! Implements `gpui_component::IconNamed`, so values slot directly into
-//! `gpui_component::Icon::new(...)` and `Button::icon(...)`. Paths point
-//! into `crates/ui/assets/`, served by [`crate::assets::AppAssets`].
-
 use gpui::SharedString;
 use gpui_component::IconNamed;
 
@@ -11,6 +5,7 @@ use gpui_component::IconNamed;
 pub enum UiIconName {
   X,
   Plus,
+  Server,
 }
 
 impl IconNamed for UiIconName {
@@ -18,6 +13,7 @@ impl IconNamed for UiIconName {
     match self {
       Self::X => "icons/x.svg".into(),
       Self::Plus => "icons/plus.svg".into(),
+      Self::Server => "icons/server.svg".into(),
     }
   }
 }
