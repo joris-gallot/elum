@@ -1,5 +1,5 @@
 [package]
-name = "elum-workspace"
+name = "workspace"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"
@@ -11,9 +11,9 @@ workspace = true
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui-component = { git = "https://github.com/longbridge/gpui-component", branch = "main" }
 
-elum-ssh = { path = "../elum-ssh" }
-elum-terminal = { path = "../elum-terminal" }
-elum-ui = { path = "../elum-ui" }
+ssh = { path = "../ssh" }
+terminal = { path = "../terminal" }
+ui = { path = "../ui" }
 
 tokio = { version = "1", features = ["rt-multi-thread"] }
 serde = { version = "1", features = ["derive"] }

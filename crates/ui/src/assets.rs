@@ -1,6 +1,6 @@
 //! Asset source for the Elum app.
 //!
-//! Scans `crates/elum-ui/assets/` at compile time via `rust-embed`, then
+//! Scans `crates/ui/assets/` at compile time via `rust-embed`, then
 //! falls back to `gpui-component-assets` for the icons rendered by
 //! `gpui-component` internals (Dialog close, Select chevron, etc.).
 //!

@@ -4,11 +4,11 @@ use std::sync::Arc;
 mod app_root;
 
 use app_root::AppRoot;
-use elum_workspace::workspace::Quit;
-use elum_workspace::{Host, HostAuth, HostBook, Workspace};
 #[cfg(target_os = "macos")]
 use gpui::{point, TitlebarOptions};
 use gpui::{px, size, App, AppContext, Bounds, Menu, MenuItem, WindowBounds, WindowOptions};
+use workspace::workspace::Quit;
+use workspace::{Host, HostAuth, HostBook, Workspace};
 
 const INITIAL_WIDTH_PX: f32 = 900.0;
 const INITIAL_HEIGHT_PX: f32 = 540.0;
@@ -44,12 +44,12 @@ fn main() {
   }
 
   gpui_platform::application()
-    .with_assets(elum_ui::AppAssets)
+    .with_assets(ui::AppAssets)
     .run(move |cx: &mut App| {
       gpui_component::init(cx);
       gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
 
-      elum_workspace::install_default_keybindings(cx);
+      workspace::install_default_keybindings(cx);
       cx.set_menus(build_app_menus());
 
       // Closing the last window quits the app

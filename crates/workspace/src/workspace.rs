@@ -1,9 +1,6 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use elum_ssh::{AuthMethod, ConnectConfig, Session, ShellHandle};
-use elum_terminal::view::{TerminalEvent, TerminalView};
-use elum_terminal::{GridSize, Terminal};
 use gpui::{
   actions, div, px, relative, Action, AnyElement, App, AppContext, Context, Entity, FocusHandle,
   Focusable, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled,
@@ -15,13 +12,16 @@ use gpui_component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
 use gpui_component::tab::{Tab as ComponentTab, TabBar};
 use gpui_component::{ActiveTheme, Sizable, StyledExt, TitleBar};
 use serde::Deserialize;
+use ssh::{AuthMethod, ConnectConfig, Session, ShellHandle};
+use terminal::view::{TerminalEvent, TerminalView};
+use terminal::{GridSize, Terminal};
 use tokio::runtime::Runtime;
 
 use crate::host_book::{Host, HostAuth, HostBook};
 use crate::keychain;
-use elum_ui::add_host_dialog::{self, NewAuth, NewHostInput};
-use elum_ui::secret_prompt::{self, SecretPrompt};
-use elum_ui::UiIconName;
+use ui::add_host_dialog::{self, NewAuth, NewHostInput};
+use ui::secret_prompt::{self, SecretPrompt};
+use ui::UiIconName;
 
 actions!(
   elum,

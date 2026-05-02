@@ -2,7 +2,7 @@
 //!
 //! Implements `gpui_component::IconNamed`, so values slot directly into
 //! `gpui_component::Icon::new(...)` and `Button::icon(...)`. Paths point
-//! into `crates/elum-ui/assets/`, served by [`crate::assets::AppAssets`].
+//! into `crates/ui/assets/`, served by [`crate::assets::AppAssets`].
 
 use gpui::SharedString;
 use gpui_component::IconNamed;

@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use elum_ssh::{ConnectConfig, Session};
+use ssh::{ConnectConfig, Session};
 use tokio::time::timeout;
 
 fn test_key_path() -> PathBuf {

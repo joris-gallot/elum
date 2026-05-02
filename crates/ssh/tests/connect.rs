@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use elum_ssh::{ConnectConfig, Session};
+use ssh::{ConnectConfig, Session};
 
 /// Path to the test private key, relative to this crate's manifest dir.
 fn test_key_path() -> PathBuf {

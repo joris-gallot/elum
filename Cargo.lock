@@ -1906,64 +1906,13 @@ dependencies = [
 name = "elum"
 version = "0.1.0"
 dependencies = [
- "elum-terminal",
- "elum-ui",
- "elum-workspace",
  "gpui",
  "gpui-component",
  "gpui_platform",
+ "terminal",
  "tokio",
-]
-
-[[package]]
-name = "elum-ssh"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "flume",
- "russh",
- "tokio",
-]
-
-[[package]]
-name = "elum-terminal"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "anyhow",
- "flume",
- "gpui",
- "parking_lot",
- "polling",
-]
-
-[[package]]
-name = "elum-ui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gpui",
- "gpui-component",
- "gpui-component-assets",
- "rust-embed",
-]
-
-[[package]]
-name = "elum-workspace"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dirs 5.0.1",
- "elum-ssh",
- "elum-terminal",
- "elum-ui",
- "gpui",
- "gpui-component",
- "keyring",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
+ "ui",
+ "workspace",
 ]
 
 [[package]]
@@ -6939,6 +6888,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssh"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flume",
+ "russh",
+ "tokio",
+]
+
+[[package]]
 name = "ssh-cipher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7339,6 +7298,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "terminal"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "flume",
+ "gpui",
+ "parking_lot",
+ "polling",
 ]
 
 [[package]]
@@ -7779,6 +7750,17 @@ dependencies = [
  "memoffset",
  "tempfile",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "gpui-component",
+ "gpui-component-assets",
+ "rust-embed",
 ]
 
 [[package]]
@@ -9245,6 +9227,24 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "workspace"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs 5.0.1",
+ "gpui",
+ "gpui-component",
+ "keyring",
+ "serde",
+ "serde_json",
+ "ssh",
+ "tempfile",
+ "terminal",
+ "tokio",
+ "ui",
 ]
 
 [[package]]

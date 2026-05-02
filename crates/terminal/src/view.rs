@@ -15,7 +15,7 @@ use gpui::{
   ScrollWheelEvent, Styled, Task, Window,
 };
 
-actions!(elum_terminal, [Copy, Paste, SelectAll,]);
+actions!(terminal, [Copy, Paste, SelectAll,]);
 
 pub const KEY_CONTEXT: &str = "TerminalView";
 
@@ -364,7 +364,7 @@ impl Render for TerminalView {
     self.sync_size_to_viewport(window);
 
     div()
-      .id("elum-terminal-view")
+      .id("terminal-view")
       .key_context(KEY_CONTEXT)
       .track_focus(&self.focus)
       .on_action(cx.listener(Self::on_copy))

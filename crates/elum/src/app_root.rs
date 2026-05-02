@@ -1,8 +1,8 @@
-use elum_workspace::Workspace;
 use gpui::{
   div, prelude::*, App, Context, Entity, FocusHandle, Focusable, IntoElement, Render, Window,
 };
 use gpui_component::Root;
+use workspace::Workspace;
 
 pub struct AppRoot {
   workspace: Entity<Workspace>,

@@ -1,7 +1,7 @@
 //! Single source of truth for app keybindings.
 //!
 //! Actions stay defined in the crate that handles them (e.g. `Copy` /
-//! `Paste` / `SelectAll` in `elum-terminal`, `CloseTab` / `Quit` here),
+//! `Paste` / `SelectAll` in `terminal`, `CloseTab` / `Quit` here),
 //! but the keystroke -> action mapping lives in one place.
 //!
 //! Call [`install`] once at app startup. The binary's `main.rs` is the
@@ -10,7 +10,7 @@
 use gpui::{App, KeyBinding};
 
 use crate::workspace::{self, KEY_CONTEXT as WORKSPACE_CONTEXT};
-use elum_terminal::view::{
+use terminal::view::{
   Copy as TerminalCopy, Paste as TerminalPaste, SelectAll as TerminalSelectAll,
   KEY_CONTEXT as TERMINAL_CONTEXT,
 };

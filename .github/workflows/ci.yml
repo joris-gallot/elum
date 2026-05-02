@@ -26,9 +26,6 @@ jobs:
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
 
-      # GPUI pulls font-kit and a Linux backend (x11/wayland). aws-lc-sys
-      # (russh's crypto backend) needs cmake + a C toolchain. Anything in
-      # this list that's already on the runner image is a fast no-op.
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
