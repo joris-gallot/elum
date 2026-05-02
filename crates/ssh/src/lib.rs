@@ -252,19 +252,16 @@ async fn relay_loop(
     tokio::select! {
         msg = channel.wait() => {
             let Some(msg) = msg else { break };
-            match msg {
-                ChannelMsg::Data { ref data } => {
-                    if from_remote.send(data.to_vec()).is_err() {
-                        break;
-                    }
-                }
-                ChannelMsg::ExtendedData { ref data, ext: 1 } => {
-                    if from_remote.send(data.to_vec()).is_err() {
-                        break;
-                    }
-                }
+            let bytes_for_view = match msg {
+                ChannelMsg::Data { ref data }
+                | ChannelMsg::ExtendedData { ref data, ext: 1 } => Some(data.to_vec()),
                 ChannelMsg::Eof | ChannelMsg::Close => break,
-                _ => {}
+                _ => None,
+            };
+            if let Some(bytes) = bytes_for_view {
+                if from_remote.send(bytes).is_err() {
+                    break;
+                }
             }
         }
         res = to_remote.recv_async() => {
