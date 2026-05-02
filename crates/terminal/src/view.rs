@@ -13,7 +13,7 @@ use alacritty_terminal::event::{Event as AlacEvent, WindowSize};
 use gpui::{
   actions, div, px, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
   InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, ParentElement, Pixels,
-  Point, Render, ScrollWheelEvent, Styled, Task, Window,
+  Point, Render, ScrollWheelEvent, Styled, Subscription, Task, Window,
 };
 
 actions!(terminal, [Copy, Paste, SelectAll,]);
@@ -107,6 +107,8 @@ pub struct TerminalView {
   selection: Option<Selection>,
   cursor_blink_phase: bool,
   focus: FocusHandle,
+  _focus_in: Option<Subscription>,
+  _focus_out: Option<Subscription>,
   _relay: Task<()>,
   _blink: Task<()>,
 }
@@ -173,9 +175,26 @@ impl TerminalView {
       selection: None,
       cursor_blink_phase: true,
       focus,
+      _focus_in: None,
+      _focus_out: None,
       _relay: relay,
       _blink: blink,
     }
+  }
+
+  pub fn install_focus_handlers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if self._focus_in.is_some() || self._focus_out.is_some() {
+      return;
+    }
+
+    self._focus_in = Some(cx.on_focus_in(&self.focus, window, |this, _window, cx| {
+      this.on_focus_changed(true, cx);
+    }));
+    self._focus_out = Some(
+      cx.on_focus_out(&self.focus, window, |this, _event, _window, cx| {
+        this.on_focus_changed(false, cx);
+      }),
+    );
   }
 
   pub fn selection(&self) -> Option<Selection> {
@@ -195,6 +214,15 @@ impl TerminalView {
       self.selection = None;
       let _ = self.to_remote.send(bytes);
     }
+  }
+
+  fn on_focus_changed(&mut self, focused: bool, cx: &mut Context<Self>) {
+    let mode = self.terminal.with_term(|term| *term.mode());
+    if let Some(bytes) = focus_report(focused, mode) {
+      let _ = self.to_remote.send(bytes);
+    }
+    self.cursor_blink_phase = true;
+    cx.notify();
   }
 
   fn on_copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
@@ -758,6 +786,17 @@ fn mouse_cell((row, col): (usize, usize)) -> MouseCell {
   MouseCell::new(row, col)
 }
 
+fn focus_report(focused: bool, mode: alacritty_terminal::term::TermMode) -> Option<Vec<u8>> {
+  if !mode.contains(alacritty_terminal::term::TermMode::FOCUS_IN_OUT) {
+    return None;
+  }
+  Some(if focused {
+    b"\x1b[I".to_vec()
+  } else {
+    b"\x1b[O".to_vec()
+  })
+}
+
 /// Word-class predicate for double-click selection. Includes characters
 /// commonly found in identifiers, paths, and URLs so a double-click on
 /// `~/.config/foo.toml` selects the whole token rather than stopping at
@@ -937,6 +976,34 @@ mod alacritty_event_tests {
     let effects = effects(AlacEvent::Wakeup, None);
     assert!(effects.wakeup);
     assert!(effects.remote_writes.is_empty());
+  }
+}
+
+#[cfg(test)]
+mod focus_report_tests {
+  use super::*;
+  use alacritty_terminal::term::TermMode;
+
+  #[test]
+  fn focus_report_is_none_when_mode_is_disabled() {
+    assert_eq!(focus_report(true, TermMode::empty()), None);
+    assert_eq!(focus_report(false, TermMode::empty()), None);
+  }
+
+  #[test]
+  fn focus_report_emits_focus_in_when_enabled() {
+    assert_eq!(
+      focus_report(true, TermMode::FOCUS_IN_OUT),
+      Some(b"\x1b[I".to_vec())
+    );
+  }
+
+  #[test]
+  fn focus_report_emits_focus_out_when_enabled() {
+    assert_eq!(
+      focus_report(false, TermMode::FOCUS_IN_OUT),
+      Some(b"\x1b[O".to_vec())
+    );
   }
 }
 

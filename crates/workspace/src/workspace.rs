@@ -376,6 +376,9 @@ impl Workspace {
         let view = cx.new(move |cx| {
           TerminalView::new(terminal, from_remote, to_remote, resize_remote, shell, cx)
         });
+        view.update(cx, |view, cx| {
+          view.install_focus_handlers(window, cx);
+        });
 
         let subscription = cx.subscribe_in(
           &view,
