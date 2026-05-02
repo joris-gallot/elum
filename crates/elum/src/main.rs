@@ -4,8 +4,11 @@ use std::sync::Arc;
 mod app_root;
 
 use app_root::AppRoot;
+use elum_workspace::workspace::Quit;
 use elum_workspace::{Host, HostAuth, HostBook, Workspace};
-use gpui::{px, size, App, AppContext, Bounds, WindowBounds, WindowOptions};
+#[cfg(target_os = "macos")]
+use gpui::{point, TitlebarOptions};
+use gpui::{px, size, App, AppContext, Bounds, Menu, MenuItem, WindowBounds, WindowOptions};
 
 const INITIAL_WIDTH_PX: f32 = 900.0;
 const INITIAL_HEIGHT_PX: f32 = 540.0;
@@ -47,6 +50,7 @@ fn main() {
       gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
 
       elum_workspace::install_default_keybindings(cx);
+      cx.set_menus(build_app_menus());
 
       // Closing the last window quits the app
       cx.on_window_closed(|cx, _| {
@@ -59,6 +63,8 @@ fn main() {
       let bounds = Bounds::centered(None, size(px(INITIAL_WIDTH_PX), px(INITIAL_HEIGHT_PX)), cx);
       let opts = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
+        #[cfg(target_os = "macos")]
+        titlebar: Some(macos_titlebar_options()),
         ..Default::default()
       };
       cx.open_window(opts, move |window, cx| {
@@ -70,6 +76,23 @@ fn main() {
 
       cx.activate(true);
     });
+}
+
+#[cfg(target_os = "macos")]
+fn macos_titlebar_options() -> TitlebarOptions {
+  let mut options = gpui_component::TitleBar::title_bar_options();
+  options.title = Some("Elum".into());
+  // Center traffic lights vertically inside our 34px-high custom title bar.
+  options.traffic_light_position = Some(point(px(9.0), px(9.0)));
+  options
+}
+
+fn build_app_menus() -> Vec<Menu> {
+  vec![Menu {
+    name: "Elum".into(),
+    disabled: false,
+    items: vec![MenuItem::action("Quit Elum", Quit)],
+  }]
 }
 
 /// First-launch seed: a host pointing at the local SSH test container so

@@ -697,7 +697,7 @@ impl Render for Workspace {
   fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
     use gpui_component::{
       resizable::{h_resizable, resizable_panel},
-      ActiveTheme as _,
+      ActiveTheme as _, TitleBar,
     };
 
     let theme = cx.theme();
@@ -722,9 +722,12 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::on_quit))
       .on_action(cx.listener(Self::on_edit_host))
       .on_action(cx.listener(Self::on_delete_host))
+      .flex()
+      .flex_col()
       .size_full()
       .bg(background)
       .text_color(foreground)
+      .child(TitleBar::new())
       .child(
         h_resizable("workspace-split")
           .child(
