@@ -2,11 +2,12 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use elum_ssh::{AuthMethod, ConnectConfig, Session, ShellHandle};
-use elum_terminal::view::TerminalView;
+use elum_terminal::view::{TerminalEvent, TerminalView};
 use elum_terminal::{GridSize, Terminal};
 use gpui::{
   actions, div, px, relative, Action, AnyElement, App, AppContext, Context, Entity, FocusHandle,
-  Focusable, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled, Window,
+  Focusable, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled,
+  Subscription, Window,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::resizable::{h_resizable, resizable_panel};
@@ -72,6 +73,10 @@ struct Tab {
   id: u64,
   host: Host,
   state: TabState,
+  /// Subscription to the [`TerminalView`]'s `ShellClosed` event. Held in
+  /// the tab so it stays alive for as long as the tab does; dropped on
+  /// tab close.
+  _shell_closed: Option<Subscription>,
 }
 
 enum TabState {
@@ -129,6 +134,7 @@ impl Workspace {
       id: tab_id,
       host: host.clone(),
       state: TabState::Connecting,
+      _shell_closed: None,
     });
     self.active_tab = Some(self.tabs.len() - 1);
     cx.notify();
@@ -226,7 +232,7 @@ impl Workspace {
       match join.await {
         Ok(Ok(shell)) => {
           let _ = this.update_in(cx, move |this, window, cx| {
-            this.finalize_tab(tab_id, Ok(shell), cx);
+            this.finalize_tab(tab_id, Ok(shell), window, cx);
             this.focus_active(window, cx);
           });
         }
@@ -273,15 +279,15 @@ impl Workspace {
             });
           } else {
             let msg = format!("{err:#}");
-            let _ = this.update(cx, move |this, cx| {
-              this.finalize_tab(tab_id, Err(msg), cx);
+            let _ = this.update_in(cx, move |this, window, cx| {
+              this.finalize_tab(tab_id, Err(msg), window, cx);
             });
           }
         }
         Err(e) => {
           let msg = format!("task join error: {e}");
-          let _ = this.update(cx, move |this, cx| {
-            this.finalize_tab(tab_id, Err(msg), cx);
+          let _ = this.update_in(cx, move |this, window, cx| {
+            this.finalize_tab(tab_id, Err(msg), window, cx);
           });
         }
       }
@@ -332,6 +338,7 @@ impl Workspace {
     &mut self,
     tab_id: u64,
     result: std::result::Result<ShellHandle, String>,
+    window: &mut Window,
     cx: &mut Context<Self>,
   ) {
     let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else {
@@ -347,7 +354,20 @@ impl Workspace {
         let view = cx.new(move |cx| {
           TerminalView::new(terminal, from_remote, to_remote, resize_remote, shell, cx)
         });
+
+        let subscription = cx.subscribe_in(
+          &view,
+          window,
+          move |this, _, ev: &TerminalEvent, window, cx| match ev {
+            TerminalEvent::ShellClosed => {
+              if let Some(idx) = this.tabs.iter().position(|t| t.id == tab_id) {
+                this.close_tab_at(idx, window, cx);
+              }
+            }
+          },
+        );
         self.tabs[idx].state = TabState::Connected { view };
+        self.tabs[idx]._shell_closed = Some(subscription);
       }
       Err(error) => {
         self.tabs[idx].state = TabState::Failed { error };

@@ -10,30 +10,21 @@
 use std::sync::Arc;
 
 use gpui::{
-  actions, div, px, ClipboardItem, Context, FocusHandle, Focusable, InteractiveElement,
-  IntoElement, KeyDownEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent, Styled, Task,
-  Window,
+  actions, div, px, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
+  InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels, Point, Render,
+  ScrollWheelEvent, Styled, Task, Window,
 };
 
-// Terminal view editing actions. Keystroke wiring lives in the
-// workspace's keymap module; this crate only owns action definitions
-// and the focus context they're scoped to.
-actions!(
-  elum_terminal,
-  [
-    /// Copy the current selection to the clipboard.
-    Copy,
-    /// Paste clipboard text into the remote shell, honoring bracketed
-    /// paste mode if the remote enabled it.
-    Paste,
-    /// Select every visible cell in the grid.
-    SelectAll,
-  ]
-);
+actions!(elum_terminal, [Copy, Paste, SelectAll,]);
 
-/// Key context name for the terminal view. Set via `key_context()` on the
-/// root div; matched by `KeyBinding::new(keys, action, Some(KEY_CONTEXT))`.
 pub const KEY_CONTEXT: &str = "TerminalView";
+
+#[derive(Debug)]
+pub enum TerminalEvent {
+  /// The remote shell exited (channel EOF/close received). The view's
+  /// underlying SSH session is dead; the tab should be torn down.
+  ShellClosed,
+}
 
 use crate::colors::{default_background, default_foreground};
 use crate::element::TerminalElement;
@@ -51,10 +42,6 @@ const PADDING: f32 = 8.0;
 const MIN_COLS: u16 = 10;
 const MIN_ROWS: u16 = 5;
 
-/// Visible-coordinate selection range. Anchor is where the drag started,
-/// focus is the current end. `dragging` is true while the mouse button is
-/// held; release leaves the selection in place until the next click or
-/// keystroke that produces output bytes.
 #[derive(Clone, Copy, Debug)]
 pub struct Selection {
   pub anchor: (usize, usize),
@@ -130,6 +117,10 @@ impl TerminalView {
           cx.notify();
         });
       }
+      // Sender side dropped, the SSH relay task closed the channel
+      let _ = this.update(cx, |_, cx| {
+        cx.emit(TerminalEvent::ShellClosed);
+      });
     });
 
     Self {
@@ -365,6 +356,8 @@ impl Focusable for TerminalView {
     self.focus.clone()
   }
 }
+
+impl EventEmitter<TerminalEvent> for TerminalView {}
 
 impl Render for TerminalView {
   fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
