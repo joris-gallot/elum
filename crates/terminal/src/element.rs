@@ -19,6 +19,8 @@
 
 use std::sync::Arc;
 
+use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
   fill, point, px, relative, size, App, Bounds, CursorStyle, DispatchPhase, Element, ElementId,
   FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
@@ -30,7 +32,7 @@ use gpui::{
 use crate::colors::{
   cursor_color, default_background, default_foreground, selection_color, to_rgba,
 };
-use crate::view::{Selection, TerminalView};
+use crate::view::TerminalView;
 use crate::{CellSnapshot, GridSnapshot, Terminal};
 
 /// Vertical multiplier on font size to derive line height.
@@ -38,7 +40,6 @@ const LINE_HEIGHT_RATIO: f32 = 1.3;
 
 pub struct TerminalElement {
   terminal: Arc<Terminal>,
-  selection: Option<Selection>,
   view: WeakEntity<TerminalView>,
   focused: bool,
   blink_phase: bool,
@@ -47,14 +48,12 @@ pub struct TerminalElement {
 impl TerminalElement {
   pub fn new(
     terminal: Arc<Terminal>,
-    selection: Option<Selection>,
     view: WeakEntity<TerminalView>,
     focused: bool,
     blink_phase: bool,
   ) -> Self {
     Self {
       terminal,
-      selection,
       view,
       focused,
       blink_phase,
@@ -173,7 +172,8 @@ impl Element for TerminalElement {
     let line_h = prepaint.line_height;
     let origin = prepaint.origin;
     let snapshot = &prepaint.snapshot;
-    let selection = self.selection;
+    let selection = snapshot.selection;
+    let display_offset = snapshot.display_offset;
 
     let cursor_kind = resolve_cursor_kind(snapshot, self.focused, self.blink_phase);
 
@@ -188,6 +188,7 @@ impl Element for TerminalElement {
         snapshot.cursor,
         cursor_kind == CursorKind::Filled,
         selection,
+        display_offset,
         origin,
         cell_w,
         line_h,
@@ -323,8 +324,6 @@ enum CursorKind {
 }
 
 fn resolve_cursor_kind(snapshot: &GridSnapshot, focused: bool, blink_phase: bool) -> CursorKind {
-  use alacritty_terminal::vte::ansi::CursorShape;
-
   if !snapshot.cursor_visible {
     return CursorKind::None;
   }
@@ -407,7 +406,8 @@ fn paint_row_backgrounds(
   row_idx: usize,
   cursor: (usize, usize),
   cursor_filled: bool,
-  selection: Option<Selection>,
+  selection: Option<alacritty_terminal::selection::SelectionRange>,
+  display_offset: usize,
   origin: Point<Pixels>,
   cell_w: Pixels,
   line_h: Pixels,
@@ -418,6 +418,7 @@ fn paint_row_backgrounds(
   window: &mut Window,
 ) {
   let y = origin.y + line_h * row_idx as f32;
+  let grid_line = Line(row_idx as i32 - display_offset as i32);
 
   let mut run_start: Option<usize> = None;
   let mut run_color: Rgba = bg_default;
@@ -425,7 +426,15 @@ fn paint_row_backgrounds(
   for (col, cell) in row.iter().enumerate() {
     let bg = effective_bg(cell, fg_default, bg_default);
     let is_cursor = cursor_filled && cursor == (row_idx, col);
-    let is_selected = selection.is_some_and(|s| s.contains(row_idx, col));
+    let is_selected = selection.is_some_and(|range| {
+      let here = range.contains(AlacPoint::new(grid_line, Column(col)));
+      // Wide-char trailing spacers should highlight together with the
+      // left half: alacritty's range only covers the left cell, so we
+      // also accept the cell at col-1 when this is a spacer.
+      let spacer_partner =
+        cell.wide_spacer && col > 0 && range.contains(AlacPoint::new(grid_line, Column(col - 1)));
+      here || spacer_partner
+    });
     // Selection wins over cursor: the user is highlighting this cell,
     // not editing at it. Cursor wins over the cell's own bg.
     let final_bg = if is_selected {

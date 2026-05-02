@@ -7,11 +7,12 @@ use gpui::{
   Focusable, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled,
   Subscription, Window,
 };
-use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
+use gpui_component::dialog::DialogButtonProps;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
 use gpui_component::tab::{Tab as ComponentTab, TabBar};
-use gpui_component::{ActiveTheme, Sizable, StyledExt, TitleBar};
+use gpui_component::{ActiveTheme, Sizable, StyledExt, TitleBar, WindowExt as _};
 use serde::Deserialize;
 use ssh::{AuthMethod, ConnectConfig, Session, ShellHandle};
 use terminal::view::{TerminalEvent, TerminalView};
@@ -559,8 +560,6 @@ impl Workspace {
   }
 
   fn on_delete_host(&mut self, action: &DeleteHost, window: &mut Window, cx: &mut Context<Self>) {
-    use gpui_component::{button::ButtonVariant, dialog::DialogButtonProps, WindowExt as _};
-
     let host_id = action.0.to_string();
     let Some(host) = self.host_book.hosts().iter().find(|h| h.id == host_id) else {
       return;
@@ -691,7 +690,7 @@ impl Workspace {
         .unwrap_or(&tab.host.name);
 
       let tab_el = ComponentTab::new()
-        .label(SharedString::from(label.to_string()))
+        .label(SharedString::from(label.clone()))
         .suffix(close_button)
         .when(tab.has_bell, |tab| {
           tab.prefix(

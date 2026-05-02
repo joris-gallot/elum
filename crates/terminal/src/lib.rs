@@ -12,11 +12,13 @@ use std::sync::Arc;
 
 use alacritty_terminal::{
   event::{Event as AlacEvent, EventListener},
-  grid::Dimensions,
-  index::{Column, Line, Point, Side},
+  grid::{Dimensions, Scroll},
+  index::{Column, Line, Point as AlacPoint, Side},
   selection::{Selection as AlacSelection, SelectionType},
+  term::cell::Flags,
   term::color,
   term::Config,
+  term::TermMode,
   vte::ansi::{Processor, StdSyncHandler},
   Term,
 };
@@ -85,13 +87,6 @@ pub struct Terminal {
   events: Receiver<AlacEvent>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SelectionKind {
-  Cell,
-  Word,
-  Line,
-}
-
 impl Terminal {
   pub fn new(size: GridSize) -> Self {
     let (events_tx, events_rx) = unbounded();
@@ -137,7 +132,6 @@ impl Terminal {
   /// toward live output. No-op if no scrollback is available in the
   /// requested direction.
   pub fn scroll_lines(&self, delta: i32) {
-    use alacritty_terminal::grid::Scroll;
     let mut term = self.term.lock();
     term.scroll_display(Scroll::Delta(delta));
   }
@@ -146,7 +140,6 @@ impl Terminal {
   /// Called when the user types something, since output should land in
   /// view rather than be hidden under scrollback.
   pub fn scroll_to_bottom(&self) {
-    use alacritty_terminal::grid::Scroll;
     let mut term = self.term.lock();
     term.scroll_display(Scroll::Bottom);
   }
@@ -156,6 +149,64 @@ impl Terminal {
   /// forward bytes to the SSH channel.
   pub fn drain_events(&self) -> Vec<AlacEvent> {
     self.events.try_iter().collect()
+  }
+
+  /// How many lines the user has scrolled into history. `0` means the
+  /// viewport is showing live output.
+  pub fn display_offset(&self) -> usize {
+    self.term.lock().grid().display_offset()
+  }
+
+  /// Start a fresh selection of the given kind anchored at `point` / `side`.
+  /// Replaces any prior selection.
+  pub fn start_selection(&self, ty: SelectionType, point: AlacPoint, side: Side) {
+    let mut term = self.term.lock();
+    term.selection = Some(AlacSelection::new(ty, point, side));
+  }
+
+  /// Drag the focus end of the live selection. No-op if no selection has
+  /// been started.
+  pub fn update_selection(&self, point: AlacPoint, side: Side) {
+    let mut term = self.term.lock();
+    if let Some(sel) = term.selection.as_mut() {
+      sel.update(point, side);
+    }
+  }
+
+  /// Drop the current selection. Idempotent.
+  pub fn clear_selection(&self) {
+    let mut term = self.term.lock();
+    term.selection = None;
+  }
+
+  /// True if the user currently has any selection active.
+  pub fn has_selection(&self) -> bool {
+    self.term.lock().selection.is_some()
+  }
+
+  /// Materialize the selected cells as a `String`, honoring wide chars,
+  /// trailing whitespace stripping, and CRLF semantics. Returns `None`
+  /// if the selection is empty or out of grid bounds.
+  pub fn selection_text(&self) -> Option<String> {
+    self.term.lock().selection_to_string()
+  }
+
+  /// Replace the selection with one covering everything from the topmost
+  /// scrollback line to the bottommost live row. Matches the behavior of
+  /// iTerm2 / Terminal.app when the user invokes "Select All" (scrollback
+  /// included, not just the visible viewport).
+  pub fn select_all(&self) {
+    let mut term = self.term.lock();
+    let topmost = term.topmost_line();
+    let bottommost = term.bottommost_line();
+    let last_col = term.last_column();
+    let mut sel = AlacSelection::new(
+      SelectionType::Simple,
+      AlacPoint::new(topmost, Column(0)),
+      Side::Left,
+    );
+    sel.update(AlacPoint::new(bottommost, last_col), Side::Right);
+    term.selection = Some(sel);
   }
 
   /// RGB value for a terminal color request. Runtime OSC color overrides
@@ -174,37 +225,17 @@ impl Terminal {
     self.with_term(|term| term.cursor_style().blinking)
   }
 
-  /// Convert a display-coordinate selection to text using alacritty's own
-  /// selection serializer. This preserves terminal details like wrapped
-  /// lines and wide-character spacer cells better than reconstructing text
-  /// from our rendered cell snapshot.
-  pub fn selected_text(
-    &self,
-    start: (usize, usize),
-    end_exclusive: (usize, usize),
-    kind: SelectionKind,
-  ) -> Option<String> {
-    let mut term = self.term.lock();
-    let selection = selection_from_display_range(&term, start, end_exclusive, kind)?;
-    let previous = term.selection.replace(selection);
-    let text = term.selection_to_string();
-    term.selection = previous;
-    text
-  }
-
   /// Snapshot the visible grid as one `String` per row. Trailing whitespace
   /// is stripped per line. Used by debug/log paths; the styled view uses
   /// [`Terminal::snapshot_grid`] instead.
   pub fn snapshot_lines(&self) -> Vec<String> {
-    use alacritty_terminal::index::{Column, Line, Point};
-
     self.with_term(|term| {
       let cols = term.columns();
       let rows = term.screen_lines();
       (0..rows)
         .map(|row| {
           (0..cols)
-            .map(|col| term.grid()[Point::new(Line(row as i32), Column(col))].c)
+            .map(|col| term.grid()[AlacPoint::new(Line(row as i32), Column(col))].c)
             .collect::<String>()
             .trim_end()
             .to_string()
@@ -219,10 +250,6 @@ impl Terminal {
   /// snapshot reflects the historical lines, not the live bottom of the
   /// grid.
   pub fn snapshot_grid(&self) -> GridSnapshot {
-    use alacritty_terminal::index::{Column, Line, Point};
-    use alacritty_terminal::term::cell::Flags;
-    use alacritty_terminal::term::TermMode;
-
     self.with_term(|term| {
       let cols = term.columns();
       let rows = term.screen_lines();
@@ -243,7 +270,7 @@ impl Terminal {
           let grid_line = row as i32 - display_offset;
           (0..cols)
             .map(|col| {
-              let cell = &term.grid()[Point::new(Line(grid_line), Column(col))];
+              let cell = &term.grid()[AlacPoint::new(Line(grid_line), Column(col))];
               CellSnapshot {
                 c: cell.c,
                 fg: cell.fg,
@@ -259,55 +286,22 @@ impl Terminal {
         })
         .collect();
 
+      // Selection range - clipped/normalized by alacritty against the
+      // grid, so the painter doesn't need to worry about the order of
+      // anchor/focus or scrollback edges.
+      let selection_range = term.selection.as_ref().and_then(|s| s.to_range(term));
+
       GridSnapshot {
         rows: snapshot_rows,
         cursor,
         cursor_visible,
         cursor_shape: style.shape,
         cursor_blinking: style.blinking,
+        selection: selection_range,
+        display_offset: display_offset as usize,
       }
     })
   }
-}
-
-fn selection_from_display_range(
-  term: &Term<ChannelListener>,
-  start: (usize, usize),
-  end_exclusive: (usize, usize),
-  kind: SelectionKind,
-) -> Option<AlacSelection> {
-  if start >= end_exclusive {
-    return None;
-  }
-
-  let display_offset = term.grid().display_offset() as i32;
-  let last_col = term.columns().saturating_sub(1);
-  let line_for_row = |row: usize| Line(row as i32 - display_offset);
-  let col = |col: usize| Column(col.min(last_col));
-
-  let selection_type = match kind {
-    // Word-mode is already snapped by the view. Use a simple alacritty range
-    // here so copied text exactly matches the visible highlighted cells.
-    SelectionKind::Cell | SelectionKind::Word => SelectionType::Simple,
-    SelectionKind::Line => SelectionType::Lines,
-  };
-
-  let start_point = Point::new(line_for_row(start.0), col(start.1));
-  let (end_row, end_col, end_side) = match selection_type {
-    SelectionType::Lines => (end_exclusive.0, 0, Side::Right),
-    _ if end_exclusive.1 == 0 => {
-      if end_exclusive.0 == 0 {
-        return None;
-      }
-      (end_exclusive.0 - 1, last_col, Side::Right)
-    }
-    _ => (end_exclusive.0, end_exclusive.1 - 1, Side::Right),
-  };
-
-  let end_point = Point::new(line_for_row(end_row), col(end_col));
-  let mut selection = AlacSelection::new(selection_type, start_point, Side::Left);
-  selection.update(end_point, end_side);
-  Some(selection)
 }
 
 /// One terminal cell flattened for rendering. Color is left as alacritty's
@@ -333,11 +327,21 @@ pub struct GridSnapshot {
   pub cursor_visible: bool,
   pub cursor_shape: alacritty_terminal::vte::ansi::CursorShape,
   pub cursor_blinking: bool,
+  /// Live selection clipped to grid bounds, in absolute alacritty grid
+  /// coordinates. The painter must subtract `display_offset` to translate
+  /// to viewport rows.
+  pub selection: Option<alacritty_terminal::selection::SelectionRange>,
+  /// Number of lines the user has scrolled up into history. Display row
+  /// `r` corresponds to grid `Line(r as i32 - display_offset as i32)`.
+  pub display_offset: usize,
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+  use alacritty_terminal::event::Event;
+  use alacritty_terminal::index::{Column, Line, Point, Side};
+  use alacritty_terminal::selection::SelectionType;
 
   fn cell_at(t: &Terminal, line: usize, col: usize) -> char {
     t.with_term(|term| {
@@ -363,8 +367,6 @@ mod tests {
 
   #[test]
   fn device_attributes_sequence_emits_pty_write_event() {
-    use alacritty_terminal::event::Event;
-
     let t = Terminal::new(GridSize::new(24, 80));
     t.write_remote(b"\x1b[c");
 
@@ -386,38 +388,127 @@ mod tests {
     assert_eq!(cols, 40);
   }
 
-  #[test]
-  fn selected_text_uses_terminal_wrapped_line_serialization() {
-    let mut size = GridSize::new(3, 3);
-    size.scrollback = 10;
-    let t = Terminal::new(size);
-    t.write_remote(b"abcdef");
-
-    assert_eq!(
-      t.selected_text((0, 0), (1, 3), SelectionKind::Cell),
-      Some("abcdef".to_string())
-    );
-  }
+  // ---- Selection-state tests --------------------------------------------
+  // These tests drive the terminal's alacritty-backed selection through
+  // `start_selection` / `update_selection` / `clear_selection` and verify
+  // the round-trip through `selection_text` and `snapshot_grid`.
 
   #[test]
-  fn selected_text_skips_wide_char_spacer_cells() {
+  fn start_selection_then_update_to_end_returns_full_text() {
     let t = Terminal::new(GridSize::new(3, 10));
-    t.write_remote("你x".as_bytes());
+    t.write_remote(b"hello");
 
-    assert_eq!(
-      t.selected_text((0, 0), (0, 3), SelectionKind::Cell),
-      Some("你x".to_string())
+    t.start_selection(
+      SelectionType::Simple,
+      Point::new(Line(0), Column(0)),
+      Side::Left,
     );
+    t.update_selection(Point::new(Line(0), Column(4)), Side::Right);
+
+    assert_eq!(t.selection_text(), Some("hello".to_string()));
   }
 
   #[test]
-  fn selected_text_line_mode_preserves_terminal_line_semantics() {
+  fn clear_selection_drops_text() {
+    let t = Terminal::new(GridSize::new(3, 10));
+    t.write_remote(b"hello");
+    t.start_selection(
+      SelectionType::Simple,
+      Point::new(Line(0), Column(0)),
+      Side::Left,
+    );
+    t.update_selection(Point::new(Line(0), Column(4)), Side::Right);
+    assert!(t.has_selection());
+
+    t.clear_selection();
+    assert!(!t.has_selection());
+    assert_eq!(t.selection_text(), None);
+  }
+
+  #[test]
+  fn semantic_selection_expands_to_word_boundaries() {
+    let t = Terminal::new(GridSize::new(3, 30));
+    t.write_remote(b"hello world foo");
+
+    // Anchor inside `world`. Semantic mode snaps to word bounds even
+    // without dragging the focus.
+    t.start_selection(
+      SelectionType::Semantic,
+      Point::new(Line(0), Column(7)),
+      Side::Left,
+    );
+    t.update_selection(Point::new(Line(0), Column(8)), Side::Right);
+
+    assert_eq!(t.selection_text(), Some("world".to_string()));
+  }
+
+  #[test]
+  fn lines_selection_emits_full_line_with_trailing_newline() {
     let t = Terminal::new(GridSize::new(3, 10));
     t.write_remote(b"alpha\r\nbeta");
 
-    assert_eq!(
-      t.selected_text((0, 0), (0, 10), SelectionKind::Line),
-      Some("alpha\n".to_string())
+    t.start_selection(
+      SelectionType::Lines,
+      Point::new(Line(0), Column(2)),
+      Side::Left,
     );
+
+    assert_eq!(t.selection_text(), Some("alpha\n".to_string()));
+  }
+
+  #[test]
+  fn select_all_covers_visible_grid() {
+    let t = Terminal::new(GridSize::new(3, 5));
+    t.write_remote(b"abc");
+    t.select_all();
+
+    let text = t.selection_text().expect("non-empty selection");
+    assert!(
+      text.starts_with("abc"),
+      "expected select_all to cover written text, got {text:?}"
+    );
+  }
+
+  #[test]
+  fn snapshot_exposes_selection_range_in_absolute_grid_coords() {
+    let t = Terminal::new(GridSize::new(3, 10));
+    t.write_remote(b"hello");
+    t.start_selection(
+      SelectionType::Simple,
+      Point::new(Line(0), Column(0)),
+      Side::Left,
+    );
+    t.update_selection(Point::new(Line(0), Column(2)), Side::Right);
+
+    let snap = t.snapshot_grid();
+    let range = snap.selection.expect("selection range present in snapshot");
+    assert_eq!(range.start, Point::new(Line(0), Column(0)));
+    assert_eq!(range.end, Point::new(Line(0), Column(2)));
+    assert_eq!(snap.display_offset, 0);
+  }
+
+  #[test]
+  fn selection_in_scrollback_survives_scroll() {
+    // Selection is stored in absolute grid coords (Line can be negative
+    // for scrollback), so scrolling must not move the highlight relative
+    // to its content.
+    let mut size = GridSize::new(3, 10);
+    size.scrollback = 50;
+    let t = Terminal::new(size);
+    for i in 0..10 {
+      t.write_remote(format!("line{i}\r\n").as_bytes());
+    }
+
+    // Anchor a selection on a scrollback line (Line(-5)) and scroll
+    // around. The text it serializes should be stable.
+    t.start_selection(
+      SelectionType::Lines,
+      Point::new(Line(-5), Column(0)),
+      Side::Left,
+    );
+    let text_before = t.selection_text();
+    t.scroll_lines(3);
+    let text_after = t.selection_text();
+    assert_eq!(text_before, text_after);
   }
 }

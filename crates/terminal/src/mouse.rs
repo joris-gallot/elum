@@ -4,8 +4,59 @@
 //! a button/scroll event, modifiers, and the current alacritty `TermMode`.
 //! The returned bytes can be written straight to the SSH/PTTY channel.
 
+use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
 use alacritty_terminal::term::TermMode;
-use gpui::{Modifiers, MouseButton};
+use gpui::{Modifiers, MouseButton, Pixels, Point};
+
+/// Convert an element-local pixel point into an absolute alacritty grid
+/// point and the cell side (left/right) the cursor sits on.
+///
+/// `display_offset` is `term.grid().display_offset()`, how many lines
+/// the user has scrolled up into the scrollback. The returned `Line` is
+/// negative when the click landed in scrollback.
+///
+/// Inputs that fall outside the grid are clamped to the nearest edge,
+/// with `side` set to indicate the overshoot direction (so a drag past
+/// the right edge keeps including cells out to the last column).
+pub fn pixel_to_point_and_side(
+  pos: Point<Pixels>,
+  cell_width: Pixels,
+  line_height: Pixels,
+  cols: usize,
+  rows: usize,
+  display_offset: usize,
+) -> (AlacPoint, Side) {
+  let cell_w = f32::from(cell_width).max(1.0);
+  let line_h = f32::from(line_height).max(1.0);
+  let x = f32::from(pos.x).max(0.0);
+  let y = f32::from(pos.y).max(0.0);
+
+  let mut col = (x / cell_w) as usize;
+  let cell_x = x % cell_w;
+  let mut side = if cell_x > cell_w / 2.0 {
+    Side::Right
+  } else {
+    Side::Left
+  };
+  let last_col = cols.saturating_sub(1);
+  if col > last_col {
+    col = last_col;
+    side = Side::Right;
+  }
+
+  let mut viewport_row = (y / line_h) as i32;
+  if rows > 0 && viewport_row >= rows as i32 {
+    viewport_row = rows as i32 - 1;
+    side = Side::Right;
+  }
+  if viewport_row < 0 {
+    viewport_row = 0;
+    side = Side::Left;
+  }
+
+  let line = Line(viewport_row - display_offset as i32);
+  (AlacPoint::new(line, Column(col)), side)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MouseCell {
@@ -226,6 +277,89 @@ fn sgr_mouse_report(cell: MouseCell, button: u8, pressed: bool) -> String {
     cell.row + 1,
     suffix
   )
+}
+
+#[cfg(test)]
+mod pixel_to_point_tests {
+  use super::*;
+  use gpui::px;
+
+  fn pt(x: f32, y: f32) -> Point<Pixels> {
+    Point::new(px(x), px(y))
+  }
+
+  // Standard grid metrics used across the tests so the math is easy to
+  // verify by inspection (10×16 cells, 80×24 grid).
+  const CW: f32 = 10.0;
+  const LH: f32 = 16.0;
+  const COLS: usize = 80;
+  const ROWS: usize = 24;
+
+  #[test]
+  fn click_inside_left_half_picks_left_side() {
+    let (p, s) = pixel_to_point_and_side(pt(3.0, 8.0), px(CW), px(LH), COLS, ROWS, 0);
+    assert_eq!(p, AlacPoint::new(Line(0), Column(0)));
+    assert_eq!(s, Side::Left);
+  }
+
+  #[test]
+  fn click_inside_right_half_picks_right_side() {
+    let (p, s) = pixel_to_point_and_side(pt(7.0, 8.0), px(CW), px(LH), COLS, ROWS, 0);
+    assert_eq!(p, AlacPoint::new(Line(0), Column(0)));
+    assert_eq!(s, Side::Right);
+  }
+
+  #[test]
+  fn click_at_cell_boundary_advances_to_next_column() {
+    // x = 10.0 = exactly cell_w → next column, left half.
+    let (p, s) = pixel_to_point_and_side(pt(10.0, 8.0), px(CW), px(LH), COLS, ROWS, 0);
+    assert_eq!(p.column, Column(1));
+    assert_eq!(s, Side::Left);
+  }
+
+  #[test]
+  fn click_past_right_edge_clamps_to_last_column_with_right_side() {
+    let x = (COLS as f32 + 5.0) * CW;
+    let (p, s) = pixel_to_point_and_side(pt(x, 8.0), px(CW), px(LH), COLS, ROWS, 0);
+    assert_eq!(p.column, Column(COLS - 1));
+    assert_eq!(s, Side::Right);
+  }
+
+  #[test]
+  fn click_past_bottom_clamps_to_last_row_with_right_side() {
+    let y = (ROWS as f32 + 3.0) * LH;
+    let (p, s) = pixel_to_point_and_side(pt(0.0, y), px(CW), px(LH), COLS, ROWS, 0);
+    assert_eq!(p.line, Line(ROWS as i32 - 1));
+    assert_eq!(s, Side::Right);
+  }
+
+  #[test]
+  fn negative_pixels_clamp_to_origin() {
+    let (p, s) = pixel_to_point_and_side(pt(-5.0, -10.0), px(CW), px(LH), COLS, ROWS, 0);
+    assert_eq!(p, AlacPoint::new(Line(0), Column(0)));
+    assert_eq!(s, Side::Left);
+  }
+
+  #[test]
+  fn display_offset_shifts_line_into_scrollback() {
+    // viewport row 0 with display_offset=5 → grid line -5 (5 lines into history).
+    let (p, _) = pixel_to_point_and_side(pt(0.0, 0.0), px(CW), px(LH), COLS, ROWS, 5);
+    assert_eq!(p.line, Line(-5));
+  }
+
+  #[test]
+  fn display_offset_lets_visible_bottom_stay_in_grid() {
+    // Last visible row with offset=5 → grid line (ROWS-1) - 5 = 18.
+    let (p, _) = pixel_to_point_and_side(
+      pt(0.0, (ROWS as f32 - 1.0) * LH + 1.0),
+      px(CW),
+      px(LH),
+      COLS,
+      ROWS,
+      5,
+    );
+    assert_eq!(p.line, Line(ROWS as i32 - 1 - 5));
+  }
 }
 
 #[cfg(test)]

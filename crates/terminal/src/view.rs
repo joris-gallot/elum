@@ -8,8 +8,11 @@
 //! width inside the element will round to the same integer cells.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use alacritty_terminal::event::{Event as AlacEvent, WindowSize};
+use alacritty_terminal::selection::SelectionType;
+use alacritty_terminal::term::TermMode;
 use gpui::{
   actions, div, px, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
   InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, ParentElement, Pixels,
@@ -37,7 +40,7 @@ use crate::mouse::{
   alt_scroll, mouse_button_report, mouse_move_report, mouse_reporting_enabled, scroll_report,
   MouseCell, ScrollDirection,
 };
-use crate::{GridSize, SelectionKind, Terminal};
+use crate::{GridSize, Terminal};
 
 const FONT_SIZE: f32 = 13.0;
 const FONT_FAMILY: &str = "Menlo";
@@ -45,53 +48,6 @@ const LINE_HEIGHT_RATIO: f32 = 1.3;
 const PADDING: f32 = 8.0;
 const MIN_COLS: u16 = 10;
 const MIN_ROWS: u16 = 5;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SelectionMode {
-  Cell,
-  Word,
-  Line,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Selection {
-  pub anchor: (usize, usize),
-  pub focus: (usize, usize),
-  pub origin: (usize, usize),
-  pub mode: SelectionMode,
-  pub dragging: bool,
-}
-
-impl Selection {
-  /// Return `(start, end)` ordered so `start <= end` in line-then-column
-  /// reading order. The end column is exclusive.
-  pub fn normalized(&self) -> ((usize, usize), (usize, usize)) {
-    if self.anchor <= self.focus {
-      (self.anchor, self.focus)
-    } else {
-      (self.focus, self.anchor)
-    }
-  }
-
-  /// Inclusive of the start cell, exclusive of the end cell - matches
-  /// how text editors typically render a drag selection.
-  pub fn contains(&self, row: usize, col: usize) -> bool {
-    let ((sr, sc), (er, ec)) = self.normalized();
-    if row < sr || row > er {
-      return false;
-    }
-    if sr == er {
-      return col >= sc && col < ec;
-    }
-    if row == sr {
-      return col >= sc;
-    }
-    if row == er {
-      return col < ec;
-    }
-    true
-  }
-}
 
 pub struct TerminalView {
   terminal: Arc<Terminal>,
@@ -104,7 +60,9 @@ pub struct TerminalView {
   last_cell_metrics: Option<(Pixels, Pixels)>,
   /// Sub-line accumulator for `ScrollWheelEvent` pixel deltas.
   scroll_px_acc: f32,
-  selection: Option<Selection>,
+  /// Pointer is currently down with the left button and we're tracking
+  /// drag updates. The selection itself lives in `term.selection`.
+  dragging: bool,
   cursor_blink_phase: bool,
   focus: FocusHandle,
   _focus_in: Option<Subscription>,
@@ -149,19 +107,16 @@ impl TerminalView {
       });
     });
 
-    let blink = cx.spawn(async move |this, cx| {
-      use std::time::Duration;
-      loop {
-        cx.background_executor()
-          .timer(Duration::from_millis(530))
-          .await;
-        let r = this.update(cx, |this, cx| {
-          this.cursor_blink_phase = !this.cursor_blink_phase;
-          cx.notify();
-        });
-        if r.is_err() {
-          break;
-        }
+    let blink = cx.spawn(async move |this, cx| loop {
+      cx.background_executor()
+        .timer(Duration::from_millis(530))
+        .await;
+      let r = this.update(cx, |this, cx| {
+        this.cursor_blink_phase = !this.cursor_blink_phase;
+        cx.notify();
+      });
+      if r.is_err() {
+        break;
       }
     });
 
@@ -172,7 +127,7 @@ impl TerminalView {
       last_size: None,
       last_cell_metrics: None,
       scroll_px_acc: 0.0,
-      selection: None,
+      dragging: false,
       cursor_blink_phase: true,
       focus,
       _focus_in: None,
@@ -197,10 +152,6 @@ impl TerminalView {
     );
   }
 
-  pub fn selection(&self) -> Option<Selection> {
-    self.selection
-  }
-
   fn handle_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
     // Anything we got here is a keystroke that didn't match a bound
     // action - forward it to the remote shell. App shortcuts (Cmd-C,
@@ -211,7 +162,7 @@ impl TerminalView {
       // Typing means engaging with the live shell - snap back to
       // bottom so input is visible, and clear any stale selection.
       self.terminal.scroll_to_bottom();
-      self.selection = None;
+      self.terminal.clear_selection();
       let _ = self.to_remote.send(bytes);
     }
   }
@@ -240,8 +191,6 @@ impl TerminalView {
   }
 
   fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
-    use alacritty_terminal::term::TermMode;
-
     let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
       return;
     };
@@ -264,36 +213,27 @@ impl TerminalView {
     };
 
     self.terminal.scroll_to_bottom();
-    self.selection = None;
+    self.terminal.clear_selection();
     let _ = self.to_remote.send(bytes);
     cx.notify();
   }
 
   fn select_all(&mut self, cx: &mut Context<Self>) {
-    let snapshot = self.terminal.snapshot_grid();
-    if snapshot.rows.is_empty() {
-      return;
-    }
-    let last_row = snapshot.rows.len() - 1;
-    let cols = snapshot.rows[last_row].len();
-    self.selection = Some(Selection {
-      anchor: (0, 0),
-      focus: (last_row, cols),
-      origin: (0, 0),
-      mode: SelectionMode::Cell,
-      dragging: false,
-    });
+    self.terminal.select_all();
     cx.notify();
   }
 
-  /// Pointer pressed inside the terminal area. `pos` is element-local
+  /// Pointer pressed inside the terminal area. `pos` is element-local.
   ///
-  /// Selection variants:
-  /// - `click_count == 1` and no shift: start a fresh drag selection.
-  /// - `click_count == 1` and shift: extend the existing selection's focus
-  ///   to the clicked cell (or start a new one if none exists).
-  /// - `click_count == 2`: select the word under the cursor.
-  /// - `click_count >= 3`: select the entire line under the cursor.
+  /// Selection variants are driven by alacritty's own `SelectionType`:
+  /// - `click_count == 1`, no shift: `Simple` selection anchored at the
+  ///   click. Drag extends focus.
+  /// - `click_count == 1`, shift held: extend the existing selection's
+  ///   focus to the click point. Otherwise behaves like a fresh click.
+  /// - `click_count == 2`: `Semantic` selection (word boundaries from
+  ///   alacritty's `Term::semantic_search_*`). Drag extends by whole
+  ///   words.
+  /// - `click_count >= 3`: `Lines` selection. Drag extends by whole lines.
   pub(crate) fn on_pointer_down(
     &mut self,
     pos: Point<Pixels>,
@@ -304,11 +244,15 @@ impl TerminalView {
     cx: &mut Context<Self>,
   ) {
     window.focus(&self.focus, cx);
-    let cell = self.pixel_to_cell(pos);
+    let (point, side) = self.pixel_to_point_and_side(pos);
+    let cell = mouse_cell((
+      (point.line.0 + self.terminal.display_offset() as i32).max(0) as usize,
+      point.column.0,
+    ));
     let mode = self.terminal.with_term(|term| *term.mode());
 
-    if let Some(bytes) = mouse_button_report(mouse_cell(cell), button, modifiers, true, mode) {
-      self.selection = None;
+    if let Some(bytes) = mouse_button_report(cell, button, modifiers, true, mode) {
+      self.terminal.clear_selection();
       self.terminal.scroll_to_bottom();
       let _ = self.to_remote.send(bytes);
       cx.notify();
@@ -316,7 +260,7 @@ impl TerminalView {
     }
 
     if mouse_reporting_enabled(mode) {
-      self.selection = None;
+      self.terminal.clear_selection();
       cx.notify();
       return;
     }
@@ -325,58 +269,33 @@ impl TerminalView {
       return;
     }
 
-    self.selection = match click_count {
-      0 | 1 if modifiers.shift => {
-        let (anchor, origin) = self
-          .selection
-          .map_or((cell, cell), |s| (s.anchor, s.origin));
-        Some(Selection {
-          anchor,
-          focus: cell,
-          origin,
-          mode: SelectionMode::Cell,
-          dragging: false,
-        })
+    match click_count {
+      0 | 1 if modifiers.shift && self.terminal.has_selection() => {
+        // Extend the existing selection's focus to the new point.
+        // Anchor/type are preserved.
+        self.terminal.update_selection(point, side);
+        self.dragging = false;
       }
-      0 | 1 => Some(Selection {
-        anchor: cell,
-        focus: cell,
-        origin: cell,
-        mode: SelectionMode::Cell,
-        dragging: true,
-      }),
-      2 => self.word_selection_at(cell),
-      _ => self.line_selection_at(cell),
-    };
+      0 | 1 => {
+        self
+          .terminal
+          .start_selection(SelectionType::Simple, point, side);
+        self.dragging = true;
+      }
+      2 => {
+        self
+          .terminal
+          .start_selection(SelectionType::Semantic, point, side);
+        self.dragging = true;
+      }
+      _ => {
+        self
+          .terminal
+          .start_selection(SelectionType::Lines, point, side);
+        self.dragging = true;
+      }
+    }
     cx.notify();
-  }
-
-  /// Word-mode selection seeded at `(row, col)`. Drag enabled so the user
-  /// can extend by whole-word increments (handled in [`Self::on_pointer_move`]).
-  fn word_selection_at(&self, cell: (usize, usize)) -> Option<Selection> {
-    let snapshot = self.terminal.snapshot_grid();
-    let (anchor, focus) = word_bounds(&snapshot, cell)?;
-    Some(Selection {
-      anchor,
-      focus,
-      origin: cell,
-      mode: SelectionMode::Word,
-      dragging: true,
-    })
-  }
-
-  /// Line-mode selection seeded at `(row, _)`. Drag enabled so the user
-  /// can extend across whole lines.
-  fn line_selection_at(&self, cell: (usize, usize)) -> Option<Selection> {
-    let snapshot = self.terminal.snapshot_grid();
-    let (anchor, focus) = line_bounds(&snapshot, cell)?;
-    Some(Selection {
-      anchor,
-      focus,
-      origin: cell,
-      mode: SelectionMode::Line,
-      dragging: true,
-    })
   }
 
   pub(crate) fn on_pointer_move(
@@ -386,82 +305,28 @@ impl TerminalView {
     modifiers: Modifiers,
     cx: &mut Context<Self>,
   ) {
-    let pointer = self.pixel_to_cell(pos);
+    let (point, side) = self.pixel_to_point_and_side(pos);
+    let cell = mouse_cell((
+      (point.line.0 + self.terminal.display_offset() as i32).max(0) as usize,
+      point.column.0,
+    ));
     let mode = self.terminal.with_term(|term| *term.mode());
 
-    if let Some(bytes) = mouse_move_report(mouse_cell(pointer), pressed_button, modifiers, mode) {
-      self.selection = None;
+    if let Some(bytes) = mouse_move_report(cell, pressed_button, modifiers, mode) {
       let _ = self.to_remote.send(bytes);
       cx.notify();
       return;
     }
 
     if mouse_reporting_enabled(mode) {
-      self.selection = None;
       return;
     }
 
-    let Some(sel) = self.selection else {
-      return;
-    };
-    if !sel.dragging {
+    if !self.dragging {
       return;
     }
-
-    // For Word/Line modes we need a fresh snapshot to recompute snapped
-    // bounds. For Cell mode, the pointer cell is the focus.
-    let new = match sel.mode {
-      SelectionMode::Cell => Selection {
-        anchor: sel.anchor,
-        focus: pointer,
-        origin: sel.origin,
-        mode: SelectionMode::Cell,
-        dragging: true,
-      },
-      SelectionMode::Word => {
-        let snapshot = self.terminal.snapshot_grid();
-        let (origin_start, origin_end) =
-          word_bounds(&snapshot, sel.origin).unwrap_or((sel.origin, sel.origin));
-        let (pointer_start, pointer_end) =
-          word_bounds(&snapshot, pointer).unwrap_or((pointer, pointer));
-        let (anchor, focus) = if pointer >= sel.origin {
-          (origin_start, pointer_end)
-        } else {
-          (pointer_start, origin_end)
-        };
-        Selection {
-          anchor,
-          focus,
-          origin: sel.origin,
-          mode: SelectionMode::Word,
-          dragging: true,
-        }
-      }
-      SelectionMode::Line => {
-        let snapshot = self.terminal.snapshot_grid();
-        let (origin_start, origin_end) =
-          line_bounds(&snapshot, sel.origin).unwrap_or((sel.origin, sel.origin));
-        let (pointer_start, pointer_end) =
-          line_bounds(&snapshot, pointer).unwrap_or((pointer, pointer));
-        let (anchor, focus) = if pointer.0 >= sel.origin.0 {
-          (origin_start, pointer_end)
-        } else {
-          (pointer_start, origin_end)
-        };
-        Selection {
-          anchor,
-          focus,
-          origin: sel.origin,
-          mode: SelectionMode::Line,
-          dragging: true,
-        }
-      }
-    };
-
-    if (new.anchor, new.focus) != (sel.anchor, sel.focus) {
-      self.selection = Some(new);
-      cx.notify();
-    }
+    self.terminal.update_selection(point, side);
+    cx.notify();
   }
 
   pub(crate) fn on_pointer_up(
@@ -471,18 +336,22 @@ impl TerminalView {
     modifiers: Modifiers,
     cx: &mut Context<Self>,
   ) {
-    let cell = self.pixel_to_cell(pos);
+    let (point, _side) = self.pixel_to_point_and_side(pos);
+    let cell = mouse_cell((
+      (point.line.0 + self.terminal.display_offset() as i32).max(0) as usize,
+      point.column.0,
+    ));
     let mode = self.terminal.with_term(|term| *term.mode());
 
-    if let Some(bytes) = mouse_button_report(mouse_cell(cell), button, modifiers, false, mode) {
-      self.selection = None;
+    if let Some(bytes) = mouse_button_report(cell, button, modifiers, false, mode) {
+      self.terminal.clear_selection();
       let _ = self.to_remote.send(bytes);
       cx.notify();
       return;
     }
 
     if mouse_reporting_enabled(mode) {
-      self.selection = None;
+      self.terminal.clear_selection();
       cx.notify();
       return;
     }
@@ -491,36 +360,42 @@ impl TerminalView {
       return;
     }
 
-    if let Some(sel) = self.selection.as_mut() {
-      sel.dragging = false;
-      // If the user merely clicked (no drag), the anchor and focus
-      // are equal - there's nothing selected. Clear the state so we
-      // don't paint a phantom highlight.
-      if sel.anchor == sel.focus {
-        self.selection = None;
-      }
+    self.dragging = false;
+    // A bare click (no drag) collapses the selection to a zero-width
+    // range; alacritty's `is_empty()` reports it. Clear so we don't
+    // paint a phantom highlight on the click cell.
+    let still_empty = self
+      .terminal
+      .with_term(|t| t.selection.as_ref().is_some_and(|s| s.is_empty()));
+    if still_empty {
+      self.terminal.clear_selection();
+      cx.notify();
     }
   }
 
-  /// Convert an element-local point (origin at the hitbox top-left, i.e.
-  /// the cell grid origin) to a `(row, col)` display cell, using the cell
-  /// metrics measured during the most recent paint. Falls back to a
-  /// crude heuristic only if no paint has happened yet (clicks landing
-  /// before the first frame are vanishingly rare in practice).
-  fn pixel_to_cell(&self, pos: Point<Pixels>) -> (usize, usize) {
-    let (cell_w, line_h) = self.last_cell_metrics.map_or(
-      (FONT_SIZE * 0.6, FONT_SIZE * LINE_HEIGHT_RATIO),
-      |(w, h)| (f32::from(w), f32::from(h)),
-    );
-    let x = f32::from(pos.x).max(0.0);
-    let y = f32::from(pos.y).max(0.0);
-    let col = (x / cell_w) as usize;
-    let row = (y / line_h) as usize;
-    // Clamp to the current grid so the user can't anchor outside it.
+  /// Convert an element-local point to an absolute alacritty grid point
+  /// plus the cell side (left/right) for half-cell precision. Uses the
+  /// cell metrics measured during the most recent paint and the live
+  /// scrollback offset so selections in scrollback stay anchored to
+  /// their content.
+  fn pixel_to_point_and_side(
+    &self,
+    pos: Point<Pixels>,
+  ) -> (
+    alacritty_terminal::index::Point,
+    alacritty_terminal::index::Side,
+  ) {
+    let (cell_w, line_h) = self
+      .last_cell_metrics
+      .unwrap_or((px(FONT_SIZE * 0.6), px(FONT_SIZE * LINE_HEIGHT_RATIO)));
     let (rows, cols) = self.last_size.unwrap_or((24, 80));
-    (
-      row.min(rows.saturating_sub(1) as usize),
-      col.min(cols.saturating_sub(1) as usize),
+    crate::mouse::pixel_to_point_and_side(
+      pos,
+      cell_w,
+      line_h,
+      cols as usize,
+      rows as usize,
+      self.terminal.display_offset(),
     )
   }
 
@@ -530,8 +405,6 @@ impl TerminalView {
     ev: &ScrollWheelEvent,
     cx: &mut Context<Self>,
   ) {
-    use alacritty_terminal::term::TermMode;
-
     // Use the real measured line height when available; fall back to the
     // FONT_SIZE-based heuristic only on the first frame.
     let line_height = self
@@ -548,7 +421,11 @@ impl TerminalView {
     self.scroll_px_acc -= lines as f32 * line_h;
 
     let mode = self.terminal.with_term(|term| *term.mode());
-    let cell = mouse_cell(self.pixel_to_cell(pos));
+    let (point, _) = self.pixel_to_point_and_side(pos);
+    let cell = mouse_cell((
+      (point.line.0 + self.terminal.display_offset() as i32).max(0) as usize,
+      point.column.0,
+    ));
     let direction = if lines.is_positive() {
       ScrollDirection::Up
     } else {
@@ -578,46 +455,11 @@ impl TerminalView {
     }
   }
 
-  /// Walk the current grid snapshot and gather the selected text, with
-  /// trailing whitespace stripped per row and lines joined by `\n`.
+  /// Materialize the live selection as plain text. Delegates to
+  /// alacritty's `selection_to_string`, which already handles wide
+  /// chars, wrapped lines, and semantic/line-mode rules correctly.
   fn copy_selection_text(&self) -> Option<String> {
-    let sel = self.selection?;
-    let (start, end) = sel.normalized();
-    let kind = match sel.mode {
-      SelectionMode::Cell => SelectionKind::Cell,
-      SelectionMode::Word => SelectionKind::Word,
-      SelectionMode::Line => SelectionKind::Line,
-    };
-    if let Some(text) = self.terminal.selected_text(start, end, kind) {
-      return Some(text);
-    }
-
-    let snapshot = self.terminal.snapshot_grid();
-    let ((sr, sc), (er, ec)) = (start, end);
-    let last_row = er.min(snapshot.rows.len().saturating_sub(1));
-    let mut out = String::new();
-    for row_idx in sr..=last_row {
-      let row = &snapshot.rows[row_idx];
-      let start = if row_idx == sr { sc } else { 0 };
-      let end = if row_idx == er { ec } else { row.len() }.min(row.len());
-      let mut line: String = row
-        .get(start..end)
-        .map(|slice| slice.iter().map(|c| c.c).collect())
-        .unwrap_or_default();
-      // Terminals pad with trailing spaces; strip them per line so
-      // copied text doesn't carry junk into pastes.
-      let trimmed_len = line.trim_end_matches(' ').len();
-      line.truncate(trimmed_len);
-      out.push_str(&line);
-      if row_idx < last_row {
-        out.push('\n');
-      }
-    }
-    if out.is_empty() {
-      None
-    } else {
-      Some(out)
-    }
+    self.terminal.selection_text()
   }
 
   /// Called by [`crate::element::TerminalElement`] every prepaint with the
@@ -799,49 +641,6 @@ fn focus_report(focused: bool, mode: alacritty_terminal::term::TermMode) -> Opti
 
 /// Word-class predicate for double-click selection. Includes characters
 /// commonly found in identifiers, paths, and URLs so a double-click on
-/// `~/.config/foo.toml` selects the whole token rather than stopping at
-/// each separator.
-fn is_word_char(c: char) -> bool {
-  c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~' | ':')
-}
-
-/// Word bounds (inclusive start, exclusive end) of the run containing
-/// `(row, col)`. Whitespace cells return a single-cell range so the user
-/// still sees feedback. `None` if the cell is out of grid range.
-fn word_bounds(
-  snapshot: &crate::GridSnapshot,
-  (row, col): (usize, usize),
-) -> Option<((usize, usize), (usize, usize))> {
-  let row_cells = snapshot.rows.get(row)?;
-  let center = row_cells.get(col)?;
-  if !is_word_char(center.c) {
-    return Some(((row, col), (row, col + 1)));
-  }
-  let mut start = col;
-  while start > 0
-    && row_cells
-      .get(start - 1)
-      .is_some_and(|cell| is_word_char(cell.c))
-  {
-    start -= 1;
-  }
-  let mut end = col;
-  while end < row_cells.len() && is_word_char(row_cells[end].c) {
-    end += 1;
-  }
-  Some(((row, start), (row, end)))
-}
-
-/// Line bounds (col 0 to row length) for the row of `(row, _)`. `None` if
-/// the row is out of range.
-fn line_bounds(
-  snapshot: &crate::GridSnapshot,
-  (row, _): (usize, usize),
-) -> Option<((usize, usize), (usize, usize))> {
-  let row_cells = snapshot.rows.get(row)?;
-  Some(((row, 0), (row, row_cells.len())))
-}
-
 impl Render for TerminalView {
   fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
     let focused = self.focus.is_focused(window);
@@ -863,7 +662,6 @@ impl Render for TerminalView {
       .p(px(PADDING))
       .child(TerminalElement::new(
         self.terminal.clone(),
-        self.selection,
         cx.entity().downgrade(),
         focused,
         blink_phase,
@@ -1004,65 +802,5 @@ mod focus_report_tests {
       focus_report(false, TermMode::FOCUS_IN_OUT),
       Some(b"\x1b[O".to_vec())
     );
-  }
-}
-
-#[cfg(test)]
-mod selection_tests {
-  use super::*;
-
-  fn sel(anchor: (usize, usize), focus: (usize, usize)) -> Selection {
-    Selection {
-      anchor,
-      focus,
-      origin: anchor,
-      mode: SelectionMode::Cell,
-      dragging: false,
-    }
-  }
-
-  #[test]
-  fn normalized_orders_anchor_focus_by_reading_order() {
-    let s = sel((5, 10), (3, 2));
-    assert_eq!(s.normalized(), ((3, 2), (5, 10)));
-  }
-
-  #[test]
-  fn contains_inclusive_start_exclusive_end_single_row() {
-    let s = sel((0, 2), (0, 6));
-    assert!(!s.contains(0, 1));
-    assert!(s.contains(0, 2));
-    assert!(s.contains(0, 5));
-    assert!(!s.contains(0, 6));
-  }
-
-  #[test]
-  fn contains_first_row_starts_at_anchor_col() {
-    let s = sel((1, 5), (3, 2));
-    assert!(!s.contains(1, 4));
-    assert!(s.contains(1, 5));
-    assert!(s.contains(1, 100));
-  }
-
-  #[test]
-  fn contains_last_row_stops_at_focus_col() {
-    let s = sel((1, 5), (3, 2));
-    assert!(s.contains(3, 0));
-    assert!(s.contains(3, 1));
-    assert!(!s.contains(3, 2));
-  }
-
-  #[test]
-  fn contains_middle_rows_full_width() {
-    let s = sel((1, 5), (3, 2));
-    assert!(s.contains(2, 0));
-    assert!(s.contains(2, 79));
-  }
-
-  #[test]
-  fn contains_outside_row_range_is_false() {
-    let s = sel((2, 0), (4, 0));
-    assert!(!s.contains(1, 50));
-    assert!(!s.contains(5, 0));
   }
 }
