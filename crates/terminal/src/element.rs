@@ -23,10 +23,10 @@ use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
   fill, point, px, relative, size, App, Bounds, CursorStyle, DispatchPhase, Element, ElementId,
-  FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InputHandler,
-  InspectorElementId, IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-  Point, Rgba, ScrollWheelEvent, SharedString, Size, Style, TextAlign, TextRun, TextStyle,
-  UTF16Selection, UnderlineStyle, WeakEntity, Window,
+  FontFallbacks, FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
+  InputHandler, InspectorElementId, IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent,
+  MouseUpEvent, Pixels, Point, Rgba, ScrollWheelEvent, SharedString, Size, StrikethroughStyle,
+  Style, TextAlign, TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity, Window,
 };
 
 use crate::colors::{
@@ -37,6 +37,16 @@ use crate::{CellSnapshot, GridSnapshot, Terminal};
 
 /// Vertical multiplier on font size to derive line height.
 const LINE_HEIGHT_RATIO: f32 = 1.3;
+
+const FONT_FALLBACKS: &[&str] = &[
+  "Apple Color Emoji",
+  "PingFang SC",
+  "Hiragino Sans",
+  "Apple SD Gothic Neo",
+  "Noto Color Emoji",
+  "Noto Sans CJK SC",
+  "Noto Sans",
+];
 
 pub struct TerminalElement {
   terminal: Arc<Terminal>,
@@ -117,7 +127,10 @@ impl Element for TerminalElement {
     window: &mut Window,
     cx: &mut App,
   ) -> Self::PrepaintState {
-    let text_style = window.text_style();
+    let mut text_style = window.text_style();
+    text_style.font_fallbacks = Some(FontFallbacks::from_fonts(
+      FONT_FALLBACKS.iter().map(|s| s.to_string()).collect(),
+    ));
     let rem_size = window.rem_size();
     let font_size = text_style.font_size.to_pixels(rem_size);
     let line_height = px(f32::from(font_size) * LINE_HEIGHT_RATIO);
@@ -139,13 +152,17 @@ impl Element for TerminalElement {
     let snapshot = self.terminal.snapshot_grid();
     let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
+    let scale = window.scale_factor().max(1.0);
+    let snap = |v: Pixels| Pixels::from((f32::from(v) * scale).floor() / scale);
+    let origin = Point::new(snap(bounds.origin.x), snap(bounds.origin.y));
+
     Prepaint {
       snapshot,
       cell_width,
       line_height,
       font_size,
       text_style,
-      origin: bounds.origin,
+      origin,
       hitbox,
     }
   }
@@ -601,6 +618,7 @@ struct RowRunStyle {
   bold: bool,
   italic: bool,
   underline: Option<Hsla>,
+  strikeout: Option<Hsla>,
 }
 
 impl RowRunStyle {
@@ -622,10 +640,18 @@ impl RowRunStyle {
         thickness: px(1.),
         wavy: false,
       }),
-      strikethrough: None,
+      strikethrough: self.strikeout.map(|color| StrikethroughStyle {
+        color: Some(color),
+        thickness: px(1.),
+      }),
     }
   }
 }
+
+/// Multiplier applied to the foreground alpha for cells flagged DIM
+/// (SGR 2). Sits between Alacritty (0.66), Ghostty (~0.69) and Kitty
+/// (0.75).
+const DIM_ALPHA: f32 = 0.7;
 
 fn row_run_style(
   cell: &CellSnapshot,
@@ -642,20 +668,20 @@ fn row_run_style(
     (cell_fg, cell_bg)
   };
   if is_cursor {
-    // Glyph beneath the cursor uses the cell's effective bg so it stays
-    // legible against the cursor block.
     fg = if cell.inverse { cell_fg } else { cell_bg };
   }
 
+  let mut color: Hsla = fg.into();
+  if cell.dim {
+    color.a *= DIM_ALPHA;
+  }
+
   RowRunStyle {
-    color: fg.into(),
+    color,
     bold: cell.bold,
     italic: cell.italic,
-    underline: if cell.underline {
-      Some(fg.into())
-    } else {
-      None
-    },
+    underline: cell.underline.then_some(color),
+    strikeout: cell.strikeout.then_some(color),
   }
 }
 

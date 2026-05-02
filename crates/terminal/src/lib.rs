@@ -254,7 +254,9 @@ impl Terminal {
                 bg: cell.bg,
                 bold: cell.flags.contains(Flags::BOLD),
                 italic: cell.flags.contains(Flags::ITALIC),
-                underline: cell.flags.contains(Flags::UNDERLINE),
+                underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
+                strikeout: cell.flags.contains(Flags::STRIKEOUT),
+                dim: cell.flags.contains(Flags::DIM),
                 inverse: cell.flags.contains(Flags::INVERSE),
                 wide_spacer: cell.flags.contains(Flags::WIDE_CHAR_SPACER),
               }
@@ -291,6 +293,8 @@ pub struct CellSnapshot {
   pub bold: bool,
   pub italic: bool,
   pub underline: bool,
+  pub strikeout: bool,
+  pub dim: bool,
   pub inverse: bool,
   /// Right half of a wide-char pair. Skip rendering its glyph; the left
   /// neighbor's wide glyph spans both cells visually.
