@@ -22,8 +22,8 @@ use std::sync::Arc;
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
-  fill, point, px, relative, size, App, Bounds, CursorStyle, DispatchPhase, Element, ElementId,
-  FontFallbacks, FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
+  fill, point, px, relative, size, App, Bounds, ContentMask, CursorStyle, DispatchPhase, Element,
+  ElementId, FontFallbacks, FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
   InputHandler, InspectorElementId, IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent,
   MouseUpEvent, Pixels, Point, Rgba, ScrollWheelEvent, SharedString, Size, StrikethroughStyle,
   Style, TextAlign, TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity, Window,
@@ -179,8 +179,20 @@ impl Element for TerminalElement {
   ) {
     let snapshot = &prepaint.snapshot;
     let cursor_kind = resolve_cursor_kind(snapshot, self.focused, self.blink_phase);
+
+    // Sub-line vertical offset for smooth scroll. Positive = grid shifted
+    // down (history peek from top); negative = grid shifted up (recent
+    // content peek from bottom). Pulled fresh from the view so
+    // `cx.notify()` after a sub-line accumulator change drives a repaint.
+    let sub_y = self
+      .view
+      .upgrade()
+      .map_or(px(0.), |v| px(v.read(cx).scroll_offset_y()));
+
+    let mut origin = prepaint.origin;
+    origin.y += sub_y;
     let ctx = PaintCtx {
-      origin: prepaint.origin,
+      origin,
       cell_w: prepaint.cell_width,
       line_h: prepaint.line_height,
       font_size: prepaint.font_size,
@@ -196,32 +208,53 @@ impl Element for TerminalElement {
     };
 
     // Window background - cells without explicit bg paint over this.
+    // Painted unclipped so the terminal frame stays solid even when
+    // sub-line offset would otherwise expose a strip at top or bottom.
     window.paint_quad(fill(bounds, ctx.bg_default));
 
-    // Pass 1: background quads. We coalesce horizontally adjacent cells
-    // with the same effective bg into a single quad; reduces draw calls
-    // and avoids hairlines between identical neighbors. Filled cursor
-    // is rendered as bg here so adjacent same-bg cells coalesce.
-    for (row_idx, row) in snapshot.rows.iter().enumerate() {
-      paint_row_backgrounds(&ctx, row_idx, row, window);
-    }
+    // Everything that follows is content that may extend past the viewport
+    // by up to one row of overscan; clip it to the terminal bounds so it
+    // doesn't bleed into neighboring tabs / panes during sub-line scroll.
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+      let n_rows = snapshot.rows.len() as i32;
 
-    // Pass 2: shape and paint the row text. One `shape_line` per row,
-    // with adjacent same-style cells coalesced into shared TextRuns.
-    for (row_idx, row) in snapshot.rows.iter().enumerate() {
-      paint_row_text(&ctx, row_idx, row, window, cx);
-    }
-
-    // Pass 3: non-filled cursor decorations (hollow border, beam, underline).
-    paint_cursor_overlay(cursor_kind, &ctx, window);
-
-    // Pass 4: marked text overlay if the IME is composing.
-    if let Some(view) = self.view.upgrade() {
-      let marked = view.read(cx).marked_text().map(str::to_owned);
-      if let Some(text) = marked {
-        paint_marked_text_overlay(&ctx, &text, window, cx);
+      // Pass 1: background quads. We coalesce horizontally adjacent cells
+      // with the same effective bg into a single quad; reduces draw calls
+      // and avoids hairlines between identical neighbors. Filled cursor
+      // is rendered as bg here so adjacent same-bg cells coalesce.
+      if let Some(row) = snapshot.overscan_top.as_deref() {
+        paint_row_backgrounds(&ctx, -1, row, window);
       }
-    }
+      for (row_idx, row) in snapshot.rows.iter().enumerate() {
+        paint_row_backgrounds(&ctx, row_idx as i32, row, window);
+      }
+      if let Some(row) = snapshot.overscan_bottom.as_deref() {
+        paint_row_backgrounds(&ctx, n_rows, row, window);
+      }
+
+      // Pass 2: shape and paint the row text. One `shape_line` per row,
+      // with adjacent same-style cells coalesced into shared TextRuns.
+      if let Some(row) = snapshot.overscan_top.as_deref() {
+        paint_row_text(&ctx, -1, row, window, cx);
+      }
+      for (row_idx, row) in snapshot.rows.iter().enumerate() {
+        paint_row_text(&ctx, row_idx as i32, row, window, cx);
+      }
+      if let Some(row) = snapshot.overscan_bottom.as_deref() {
+        paint_row_text(&ctx, n_rows, row, window, cx);
+      }
+
+      // Pass 3: non-filled cursor decorations (hollow border, beam, underline).
+      paint_cursor_overlay(cursor_kind, &ctx, window);
+
+      // Pass 4: marked text overlay if the IME is composing.
+      if let Some(view) = self.view.upgrade() {
+        let marked = view.read(cx).marked_text().map(str::to_owned);
+        if let Some(text) = marked {
+          paint_marked_text_overlay(&ctx, &text, window, cx);
+        }
+      }
+    });
 
     self.register_mouse_listeners(prepaint.hitbox.clone(), window);
     self.register_input_handler(&ctx, window, cx);
@@ -464,19 +497,26 @@ fn paint_marked_text_overlay(ctx: &PaintCtx<'_>, marked: &str, window: &mut Wind
 
 fn paint_row_backgrounds(
   ctx: &PaintCtx<'_>,
-  row_idx: usize,
+  row_idx: i32,
   row: &[CellSnapshot],
   window: &mut Window,
 ) {
   let y = ctx.origin.y + ctx.line_h * row_idx as f32;
-  let grid_line = Line(row_idx as i32 - ctx.display_offset as i32);
+  let grid_line = Line(row_idx - ctx.display_offset as i32);
+  // Cursor lives in viewport-local coords (`(usize, usize)`); overscan
+  // rows (row_idx == -1 or N) never carry the cursor.
+  let row_for_cursor = if row_idx >= 0 {
+    Some(row_idx as usize)
+  } else {
+    None
+  };
 
   let mut run_start: Option<usize> = None;
   let mut run_color: Rgba = ctx.bg_default;
 
   for (col, cell) in row.iter().enumerate() {
     let bg = effective_bg(cell, ctx.fg_default, ctx.bg_default);
-    let is_cursor = ctx.cursor_filled && ctx.cursor == (row_idx, col);
+    let is_cursor = ctx.cursor_filled && row_for_cursor.is_some_and(|r| ctx.cursor == (r, col));
     let is_selected = ctx.selection.is_some_and(|range| {
       let here = range.contains(AlacPoint::new(grid_line, Column(col)));
       // Wide-char trailing spacers should highlight together with the
@@ -537,11 +577,17 @@ fn flush_bg_run(
 
 fn paint_row_text(
   ctx: &PaintCtx<'_>,
-  row_idx: usize,
+  row_idx: i32,
   row: &[CellSnapshot],
   window: &mut Window,
   cx: &mut App,
 ) {
+  let row_for_cursor = if row_idx >= 0 {
+    Some(row_idx as usize)
+  } else {
+    None
+  };
+
   // Build the text and runs by coalescing adjacent cells with identical
   // style attributes (fg color + bold + italic + underline).
   let mut text = String::with_capacity(row.len());
@@ -555,7 +601,7 @@ fn paint_row_text(
     let glyph_str: SharedString = glyph.to_string().into();
     let glyph_byte_len = glyph_str.len();
 
-    let is_cursor = ctx.cursor_filled && ctx.cursor == (row_idx, col);
+    let is_cursor = ctx.cursor_filled && row_for_cursor.is_some_and(|r| ctx.cursor == (r, col));
     let style = row_run_style(
       cell,
       is_cursor,

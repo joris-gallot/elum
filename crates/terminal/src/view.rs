@@ -16,7 +16,7 @@ use alacritty_terminal::term::TermMode;
 use gpui::{
   actions, div, px, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
   InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, ParentElement, Pixels,
-  Point, Render, ScrollWheelEvent, Styled, Subscription, Task, Window,
+  Point, Render, ScrollWheelEvent, Styled, Subscription, Task, TouchPhase, Window,
 };
 
 actions!(terminal, [Copy, Paste, SelectAll,]);
@@ -455,49 +455,86 @@ impl TerminalView {
     let line_height = self
       .last_cell_metrics
       .map_or_else(|| px(FONT_SIZE * LINE_HEIGHT_RATIO), |(_, h)| h);
+
+    // Reset the residual at the start of a fresh trackpad gesture. Without
+    // this, leftover sub-line offset (up to ~1 line) from the previous
+    // gesture would jump the viewport on the first event of the next.
+    if matches!(ev.touch_phase, TouchPhase::Started) {
+      self.scroll_px_acc = 0.0;
+    }
+
     let pixel_y = ev.delta.pixel_delta(line_height).y;
     self.scroll_px_acc += f32::from(pixel_y);
 
     let line_h = f32::from(line_height);
     let lines = (self.scroll_px_acc / line_h) as i32;
-    if lines == 0 {
-      return;
-    }
     self.scroll_px_acc -= lines as f32 * line_h;
 
     let mode = self.terminal.with_term(|term| *term.mode());
-    let (point, _) = self.pixel_to_point_and_side(pos);
-    let cell = mouse_cell((
-      (point.line.0 + self.terminal.display_offset() as i32).max(0) as usize,
-      point.column.0,
-    ));
-    let direction = if lines.is_positive() {
-      ScrollDirection::Up
-    } else {
-      ScrollDirection::Down
-    };
 
-    if let Some(report) = scroll_report(cell, direction, ev.modifiers, mode) {
-      let count = lines.unsigned_abs() as usize;
-      let mut bytes = Vec::with_capacity(report.len() * count);
-      for _ in 0..count {
-        bytes.extend_from_slice(&report);
+    if lines != 0 {
+      let (point, _) = self.pixel_to_point_and_side(pos);
+      let cell = mouse_cell((
+        (point.line.0 + self.terminal.display_offset() as i32).max(0) as usize,
+        point.column.0,
+      ));
+      let direction = if lines.is_positive() {
+        ScrollDirection::Up
+      } else {
+        ScrollDirection::Down
+      };
+
+      if let Some(report) = scroll_report(cell, direction, ev.modifiers, mode) {
+        let count = lines.unsigned_abs() as usize;
+        let mut bytes = Vec::with_capacity(report.len() * count);
+        for _ in 0..count {
+          bytes.extend_from_slice(&report);
+        }
+        let _ = self.to_remote.send(bytes);
+        // Mouse-mode reporting: the remote owns the viewport. Don't
+        // carry a sub-line offset that would visually shift the grid.
+        self.scroll_px_acc = 0.0;
+      } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+        // Alt-screen apps (vim, htop, less, man, top, …) keep their own
+        // viewport; the local scrollback is empty there. When the remote
+        // also opted into ALTERNATE_SCROLL, translate wheel deltas into
+        // up/down arrow keystrokes so the app scrolls naturally.
+        let bytes = alt_scroll(lines, mode.contains(TermMode::APP_CURSOR));
+        let _ = self.to_remote.send(bytes);
+        // Same rationale as mouse-mode: remote app redraws in place.
+        self.scroll_px_acc = 0.0;
+      } else {
+        self.terminal.scroll_lines(lines);
       }
-      let _ = self.to_remote.send(bytes);
-      cx.notify();
-      return;
     }
 
-    // Alt-screen apps (vim, htop, less, man, top, …) keep their own
-    // viewport; the local scrollback is empty there. When the remote
-    // also opted into ALTERNATE_SCROLL, translate wheel deltas into
-    // up/down arrow keystrokes so the app scrolls naturally.
-    if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
-      let bytes = alt_scroll(lines, mode.contains(TermMode::APP_CURSOR));
-      let _ = self.to_remote.send(bytes);
-    } else {
-      self.terminal.scroll_lines(lines);
+    // Edge clamp for normal scrollback: at the top of history a positive
+    // residual would peek empty space above; at the live bottom a negative
+    // residual would peek empty space below. Drop the residual at the edge
+    // so the viewport rests cleanly on the grid.
+    if !self.is_remote_owned_scroll(mode) {
+      let display_offset = self.terminal.display_offset();
+      let history_size = self.terminal.history_size();
+      if (self.scroll_px_acc > 0.0 && display_offset >= history_size)
+        || (self.scroll_px_acc < 0.0 && display_offset == 0)
+      {
+        self.scroll_px_acc = 0.0;
+      }
     }
+
+    cx.notify();
+  }
+
+  fn is_remote_owned_scroll(&self, mode: TermMode) -> bool {
+    crate::mouse::mouse_reporting_enabled(mode)
+      || mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
+  }
+
+  /// Sub-line vertical paint offset, in pixels. Positive shifts the grid
+  /// downward (history peeking from top); negative shifts upward. Always
+  /// in `(-line_h, line_h)` and zero outside normal scrollback mode.
+  pub(crate) fn scroll_offset_y(&self) -> f32 {
+    self.scroll_px_acc
   }
 
   /// Materialize the live selection as plain text. Delegates to

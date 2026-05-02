@@ -157,6 +157,12 @@ impl Terminal {
     self.term.lock().grid().display_offset()
   }
 
+  /// Number of scrollback lines retained above the live screen. Caps the
+  /// maximum `display_offset` the user can reach by scrolling up.
+  pub fn history_size(&self) -> usize {
+    self.term.lock().grid().history_size()
+  }
+
   /// Start a fresh selection of the given kind anchored at `point` / `side`.
   /// Replaces any prior selection.
   pub fn start_selection(&self, ty: SelectionType, point: AlacPoint, side: Side) {
@@ -234,6 +240,7 @@ impl Terminal {
       // `display_offset > 0` we're scrolled up; the visible area maps
       // to grid lines `(row - display_offset)` for `row in 0..rows`.
       let display_offset = term.grid().display_offset() as i32;
+      let history_size = term.grid().history_size() as i32;
 
       let cursor_pt = term.grid().cursor.point;
       let cursor_display_line = cursor_pt.line.0 + display_offset;
@@ -242,28 +249,46 @@ impl Terminal {
       let cursor_visible = cursor_in_view && term.mode().contains(TermMode::SHOW_CURSOR);
       let style = term.cursor_style();
 
+      let snapshot_row = |grid_line: i32| -> Vec<CellSnapshot> {
+        (0..cols)
+          .map(|col| {
+            let cell = &term.grid()[AlacPoint::new(Line(grid_line), Column(col))];
+            CellSnapshot {
+              c: cell.c,
+              fg: cell.fg,
+              bg: cell.bg,
+              bold: cell.flags.contains(Flags::BOLD),
+              italic: cell.flags.contains(Flags::ITALIC),
+              underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
+              strikeout: cell.flags.contains(Flags::STRIKEOUT),
+              dim: cell.flags.contains(Flags::DIM),
+              inverse: cell.flags.contains(Flags::INVERSE),
+              wide_spacer: cell.flags.contains(Flags::WIDE_CHAR_SPACER),
+            }
+          })
+          .collect()
+      };
+
       let snapshot_rows: Vec<Vec<CellSnapshot>> = (0..rows)
-        .map(|row| {
-          let grid_line = row as i32 - display_offset;
-          (0..cols)
-            .map(|col| {
-              let cell = &term.grid()[AlacPoint::new(Line(grid_line), Column(col))];
-              CellSnapshot {
-                c: cell.c,
-                fg: cell.fg,
-                bg: cell.bg,
-                bold: cell.flags.contains(Flags::BOLD),
-                italic: cell.flags.contains(Flags::ITALIC),
-                underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
-                strikeout: cell.flags.contains(Flags::STRIKEOUT),
-                dim: cell.flags.contains(Flags::DIM),
-                inverse: cell.flags.contains(Flags::INVERSE),
-                wide_spacer: cell.flags.contains(Flags::WIDE_CHAR_SPACER),
-              }
-            })
-            .collect()
-        })
+        .map(|row| snapshot_row(row as i32 - display_offset))
         .collect();
+
+      // Overscan: one extra row above and below the visible viewport, used
+      // by the painter to fill the gap during sub-line scroll offsets.
+      // - Top overscan exists iff there's at least one more line in
+      //   scrollback above the topmost visible row.
+      // - Bottom overscan exists iff we're scrolled into history; below
+      //   the viewport then sits more recent content.
+      let overscan_top = if display_offset < history_size {
+        Some(snapshot_row(-1 - display_offset))
+      } else {
+        None
+      };
+      let overscan_bottom = if display_offset > 0 {
+        Some(snapshot_row(rows as i32 - display_offset))
+      } else {
+        None
+      };
 
       // Selection range - clipped/normalized by alacritty against the
       // grid, so the painter doesn't need to worry about the order of
@@ -272,6 +297,8 @@ impl Terminal {
 
       GridSnapshot {
         rows: snapshot_rows,
+        overscan_top,
+        overscan_bottom,
         cursor,
         cursor_visible,
         cursor_shape: style.shape,
@@ -304,6 +331,13 @@ pub struct CellSnapshot {
 #[derive(Debug, Clone)]
 pub struct GridSnapshot {
   pub rows: Vec<Vec<CellSnapshot>>,
+  /// Row immediately above the topmost visible row, used by the painter
+  /// to fill in during sub-line scroll offset. `None` at the top of
+  /// scrollback (no further history above).
+  pub overscan_top: Option<Vec<CellSnapshot>>,
+  /// Row immediately below the bottommost visible row. `None` when the
+  /// viewport rests at the live tail (`display_offset == 0`).
+  pub overscan_bottom: Option<Vec<CellSnapshot>>,
   pub cursor: (usize, usize),
   pub cursor_visible: bool,
   pub cursor_shape: alacritty_terminal::vte::ansi::CursorShape,
