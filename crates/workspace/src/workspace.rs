@@ -187,22 +187,36 @@ impl Workspace {
         save_label: "Save in Keychain".into(),
         confirm_label: "Connect".into(),
       },
-      move |submit, window, cx| {
+      move |result, window, cx| {
         let host = host.clone();
-        let _ = view.update(cx, |this, cx| {
-          if submit.save_in_keychain {
-            match keychain::store(&host.id, keychain::PASSWORD, &submit.secret) {
-              Ok(()) => this.mark_password_saved(&host.id),
-              Err(e) => eprintln!("warning: keychain store for {} failed: {e:#}", host.id),
+        let _ = view.update(cx, |this, cx| match result {
+          Some(submit) => {
+            if submit.save_in_keychain {
+              match keychain::store(&host.id, keychain::PASSWORD, &submit.secret) {
+                Ok(()) => this.mark_password_saved(&host.id),
+                Err(e) => eprintln!("warning: keychain store for {} failed: {e:#}", host.id),
+              }
             }
+            let auth = AuthMethod::Password {
+              password: submit.secret,
+            };
+            this.spawn_connect(tab_id, host, auth, window, cx);
           }
-          let auth = AuthMethod::Password {
-            password: submit.secret,
-          };
-          this.spawn_connect(tab_id, host, auth, window, cx);
+          None => {
+            this.close_tab_by_id(tab_id, window, cx);
+          }
         });
       },
     );
+  }
+
+  /// Drop the tab identified by `tab_id`, regardless of its current
+  /// position in `self.tabs`. No-op if the tab no longer exists (e.g.,
+  /// the user closed it manually before this fired).
+  fn close_tab_by_id(&mut self, tab_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+    if let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) {
+      self.close_tab_at(idx, window, cx);
+    }
   }
 
   fn spawn_connect(
@@ -256,23 +270,28 @@ impl Workspace {
                   save_label: "Save in Keychain".into(),
                   confirm_label: "Unlock".into(),
                 },
-                move |submit, window, cx| {
+                move |result, window, cx| {
                   let host = host.clone();
                   let key_path = key_path.clone();
-                  let _ = view.update(cx, |this, cx| {
-                    if submit.save_in_keychain {
-                      match keychain::store(&host.id, keychain::PASSPHRASE, &submit.secret) {
-                        Ok(()) => this.mark_passphrase_saved(&host.id),
-                        Err(e) => {
-                          eprintln!("warning: keychain store for {} failed: {e:#}", host.id);
+                  let _ = view.update(cx, |this, cx| match result {
+                    Some(submit) => {
+                      if submit.save_in_keychain {
+                        match keychain::store(&host.id, keychain::PASSPHRASE, &submit.secret) {
+                          Ok(()) => this.mark_passphrase_saved(&host.id),
+                          Err(e) => {
+                            eprintln!("warning: keychain store for {} failed: {e:#}", host.id);
+                          }
                         }
                       }
+                      let auth = AuthMethod::PublicKey {
+                        key_path,
+                        passphrase: Some(submit.secret),
+                      };
+                      this.spawn_connect(tab_id, host, auth, window, cx);
                     }
-                    let auth = AuthMethod::PublicKey {
-                      key_path,
-                      passphrase: Some(submit.secret),
-                    };
-                    this.spawn_connect(tab_id, host, auth, window, cx);
+                    None => {
+                      this.close_tab_by_id(tab_id, window, cx);
+                    }
                   });
                 },
               );
