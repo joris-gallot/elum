@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
   actions, div, px, relative, Action, AnyElement, App, AppContext, Context, Entity, FocusHandle,
   Focusable, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled,
@@ -73,9 +74,9 @@ struct Tab {
   id: u64,
   host: Host,
   state: TabState,
+  has_bell: bool,
   /// Subscription to the [`TerminalView`]'s `ShellClosed` event. Held in
-  /// the tab so it stays alive for as long as the tab does; dropped on
-  /// tab close.
+  /// the tab so it stays alive for as long as the tab does
   _shell_closed: Option<Subscription>,
 }
 
@@ -108,8 +109,7 @@ impl Workspace {
   }
 
   /// Focus the active tab's `TerminalView`, if any. Falls back to the app
-  /// focus handle when there is no active tab or the tab isn't connected
-  /// yet, so keystrokes always have somewhere to land.
+  /// focus handle when there is no active tab or the tab isn't connected yet
   fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
     let view_focus = self
       .active_tab
@@ -134,6 +134,7 @@ impl Workspace {
       id: tab_id,
       host: host.clone(),
       state: TabState::Connecting,
+      has_bell: false,
       _shell_closed: None,
     });
     self.active_tab = Some(self.tabs.len() - 1);
@@ -383,6 +384,15 @@ impl Workspace {
                 this.close_tab_at(idx, window, cx);
               }
             }
+            TerminalEvent::Bell => {
+              let active = this.active_tab.and_then(|i| this.tabs.get(i)).map(|t| t.id);
+              if active != Some(tab_id) {
+                if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
+                  tab.has_bell = true;
+                  cx.notify();
+                }
+              }
+            }
           },
         );
         self.tabs[idx].state = TabState::Connected { view };
@@ -398,6 +408,11 @@ impl Workspace {
   fn activate_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
     if idx < self.tabs.len() && self.active_tab != Some(idx) {
       self.active_tab = Some(idx);
+
+      if let Some(tab) = self.tabs.get_mut(idx) {
+        tab.has_bell = false;
+      }
+
       self.focus_active(window, cx);
       cx.notify();
     }
@@ -658,11 +673,20 @@ impl Workspace {
           this.close_tab_at(i, window, cx);
         }));
 
-      bar = bar.child(
-        ComponentTab::new()
-          .label(SharedString::from(tab.host.name.clone()))
-          .suffix(close_button),
-      );
+      let tab_el = ComponentTab::new()
+        .label(SharedString::from(tab.host.name.clone()))
+        .suffix(close_button)
+        .when(tab.has_bell, |tab| {
+          tab.prefix(
+            div()
+              .size(px(6.))
+              .rounded_full()
+              .bg(cx.theme().danger)
+              .ml_1(),
+          )
+        });
+
+      bar = bar.child(tab_el);
     }
 
     bar.into_any_element()

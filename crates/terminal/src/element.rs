@@ -40,6 +40,8 @@ pub struct TerminalElement {
   terminal: Arc<Terminal>,
   selection: Option<Selection>,
   view: WeakEntity<TerminalView>,
+  focused: bool,
+  blink_phase: bool,
 }
 
 impl TerminalElement {
@@ -47,11 +49,15 @@ impl TerminalElement {
     terminal: Arc<Terminal>,
     selection: Option<Selection>,
     view: WeakEntity<TerminalView>,
+    focused: bool,
+    blink_phase: bool,
   ) -> Self {
     Self {
       terminal,
       selection,
       view,
+      focused,
+      blink_phase,
     }
   }
 }
@@ -169,15 +175,18 @@ impl Element for TerminalElement {
     let snapshot = &prepaint.snapshot;
     let selection = self.selection;
 
+    let cursor_kind = resolve_cursor_kind(snapshot, self.focused, self.blink_phase);
+
     // Pass 1: background quads. We coalesce horizontally adjacent cells
     // with the same effective bg into a single quad; reduces draw calls
-    // and avoids hairlines between identical neighbors.
+    // and avoids hairlines between identical neighbors. Filled cursor
+    // is rendered as bg here so adjacent same-bg cells coalesce.
     for (row_idx, row) in snapshot.rows.iter().enumerate() {
       paint_row_backgrounds(
         row,
         row_idx,
         snapshot.cursor,
-        snapshot.cursor_visible,
+        cursor_kind == CursorKind::Filled,
         selection,
         origin,
         cell_w,
@@ -197,7 +206,7 @@ impl Element for TerminalElement {
         row,
         row_idx,
         snapshot.cursor,
-        snapshot.cursor_visible,
+        cursor_kind == CursorKind::Filled,
         origin,
         cell_w,
         line_h,
@@ -209,6 +218,17 @@ impl Element for TerminalElement {
         cx,
       );
     }
+
+    // Pass 3: non-filled cursor decorations (hollow border, beam, underline).
+    paint_cursor_overlay(
+      cursor_kind,
+      snapshot.cursor,
+      origin,
+      cell_w,
+      line_h,
+      cursor_bg,
+      window,
+    );
 
     self.register_mouse_listeners(prepaint.hitbox.clone(), window);
   }
@@ -269,12 +289,102 @@ impl TerminalElement {
   }
 }
 
+/// How the cursor should be drawn this frame, derived once at the start
+/// of paint from snapshot + focus + blink phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorKind {
+  None,
+  Filled,
+  Hollow,
+  Underline,
+  Beam,
+}
+
+fn resolve_cursor_kind(snapshot: &GridSnapshot, focused: bool, blink_phase: bool) -> CursorKind {
+  use alacritty_terminal::vte::ansi::CursorShape;
+
+  if !snapshot.cursor_visible {
+    return CursorKind::None;
+  }
+  // DECSCUSR-requested blink: hide on the off-phase. Only animates while
+  // focused; an unfocused window keeps its indicator steady.
+  if snapshot.cursor_blinking && focused && !blink_phase {
+    return CursorKind::None;
+  }
+
+  match (snapshot.cursor_shape, focused) {
+    (CursorShape::Hidden, _) => CursorKind::None,
+    // Unfocused: always hollow regardless of the requested shape
+    (_, false) => CursorKind::Hollow,
+    (CursorShape::HollowBlock, true) => CursorKind::Hollow,
+    (CursorShape::Block, true) => CursorKind::Filled,
+    (CursorShape::Underline, true) => CursorKind::Underline,
+    (CursorShape::Beam, true) => CursorKind::Beam,
+  }
+}
+
+/// Paint the cursor overlay for non-`Filled` kinds
+fn paint_cursor_overlay(
+  kind: CursorKind,
+  cursor: (usize, usize),
+  origin: Point<Pixels>,
+  cell_w: Pixels,
+  line_h: Pixels,
+  color: Rgba,
+  window: &mut Window,
+) {
+  if matches!(kind, CursorKind::None | CursorKind::Filled) {
+    return;
+  }
+  let (row, col) = cursor;
+  let cell_origin = point(
+    origin.x + cell_w * col as f32,
+    origin.y + line_h * row as f32,
+  );
+  match kind {
+    CursorKind::Hollow => {
+      let t = px(1.0);
+      window.paint_quad(fill(Bounds::new(cell_origin, size(cell_w, t)), color));
+      window.paint_quad(fill(
+        Bounds::new(
+          point(cell_origin.x, cell_origin.y + line_h - t),
+          size(cell_w, t),
+        ),
+        color,
+      ));
+      window.paint_quad(fill(Bounds::new(cell_origin, size(t, line_h)), color));
+      window.paint_quad(fill(
+        Bounds::new(
+          point(cell_origin.x + cell_w - t, cell_origin.y),
+          size(t, line_h),
+        ),
+        color,
+      ));
+    }
+    CursorKind::Underline => {
+      let t = px(2.0);
+      window.paint_quad(fill(
+        Bounds::new(
+          point(cell_origin.x, cell_origin.y + line_h - t),
+          size(cell_w, t),
+        ),
+        color,
+      ));
+    }
+    CursorKind::Beam => {
+      let t = px(2.0);
+      window.paint_quad(fill(Bounds::new(cell_origin, size(t, line_h)), color));
+    }
+    CursorKind::None | CursorKind::Filled => unreachable!(),
+  }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_row_backgrounds(
   row: &[CellSnapshot],
   row_idx: usize,
   cursor: (usize, usize),
-  cursor_visible: bool,
+  cursor_filled: bool,
   selection: Option<Selection>,
   origin: Point<Pixels>,
   cell_w: Pixels,
@@ -292,7 +402,7 @@ fn paint_row_backgrounds(
 
   for (col, cell) in row.iter().enumerate() {
     let bg = effective_bg(cell, fg_default, bg_default);
-    let is_cursor = cursor_visible && cursor == (row_idx, col);
+    let is_cursor = cursor_filled && cursor == (row_idx, col);
     let is_selected = selection.is_some_and(|s| s.contains(row_idx, col));
     // Selection wins over cursor: the user is highlighting this cell,
     // not editing at it. Cursor wins over the cell's own bg.
@@ -360,7 +470,7 @@ fn paint_row_text(
   row: &[CellSnapshot],
   row_idx: usize,
   cursor: (usize, usize),
-  cursor_visible: bool,
+  cursor_filled: bool,
   origin: Point<Pixels>,
   cell_w: Pixels,
   line_h: Pixels,
@@ -384,7 +494,7 @@ fn paint_row_text(
     let glyph_str: SharedString = glyph.to_string().into();
     let glyph_byte_len = glyph_str.len();
 
-    let is_cursor = cursor_visible && cursor == (row_idx, col);
+    let is_cursor = cursor_filled && cursor == (row_idx, col);
     let style = row_run_style(cell, is_cursor, text_style, fg_default, bg_default);
 
     match &current_style {

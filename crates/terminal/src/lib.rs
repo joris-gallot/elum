@@ -176,9 +176,10 @@ impl Terminal {
   }
 
   /// Snapshot every visible cell with its style flags, plus the cursor
-  /// position and visibility. Honors the current scroll offset: if the
-  /// user has scrolled into history, the snapshot reflects the
-  /// historical lines, not the live bottom of the grid.
+  /// position, visibility, shape, and DECSCUSR blink request. Honors the
+  /// current scroll offset: if the user has scrolled into history, the
+  /// snapshot reflects the historical lines, not the live bottom of the
+  /// grid.
   pub fn snapshot_grid(&self) -> GridSnapshot {
     use alacritty_terminal::index::{Column, Line, Point};
     use alacritty_terminal::term::cell::Flags;
@@ -197,6 +198,7 @@ impl Terminal {
       let cursor_in_view = cursor_display_line >= 0 && cursor_display_line < rows as i32;
       let cursor = (cursor_display_line.max(0) as usize, cursor_pt.column.0);
       let cursor_visible = cursor_in_view && term.mode().contains(TermMode::SHOW_CURSOR);
+      let style = term.cursor_style();
 
       let snapshot_rows: Vec<Vec<CellSnapshot>> = (0..rows)
         .map(|row| {
@@ -223,6 +225,8 @@ impl Terminal {
         rows: snapshot_rows,
         cursor,
         cursor_visible,
+        cursor_shape: style.shape,
+        cursor_blinking: style.blinking,
       }
     })
   }
@@ -244,13 +248,13 @@ pub struct CellSnapshot {
   pub wide_spacer: bool,
 }
 
-/// Frozen view of the visible grid + cursor at one instant in time.
 #[derive(Debug, Clone)]
 pub struct GridSnapshot {
   pub rows: Vec<Vec<CellSnapshot>>,
-  /// `(row, column)` in screen coordinates, both 0-indexed.
   pub cursor: (usize, usize),
   pub cursor_visible: bool,
+  pub cursor_shape: alacritty_terminal::vte::ansi::CursorShape,
+  pub cursor_blinking: bool,
 }
 
 #[cfg(test)]

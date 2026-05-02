@@ -21,9 +21,10 @@ pub const KEY_CONTEXT: &str = "TerminalView";
 
 #[derive(Debug)]
 pub enum TerminalEvent {
-  /// The remote shell exited (channel EOF/close received). The view's
-  /// underlying SSH session is dead; the tab should be torn down.
+  /// The remote shell exited (channel EOF/close received)
   ShellClosed,
+  /// The remote rang the bell (received `\x07`)
+  Bell,
 }
 
 use crate::colors::{default_background, default_foreground};
@@ -97,8 +98,10 @@ pub struct TerminalView {
   /// Sub-line accumulator for `ScrollWheelEvent` pixel deltas.
   scroll_px_acc: f32,
   selection: Option<Selection>,
+  cursor_blink_phase: bool,
   focus: FocusHandle,
   _relay: Task<()>,
+  _blink: Task<()>,
 }
 
 impl TerminalView {
@@ -123,6 +126,10 @@ impl TerminalView {
         let term = term.clone();
         let _ = this.update(cx, move |_, cx| {
           term.write(&bytes);
+          // Surface alacritty-side events (bell, exit, …)
+          for event in term.drain_events() {
+            dispatch_alac_event(event, cx);
+          }
           cx.notify();
         });
       }
@@ -130,6 +137,22 @@ impl TerminalView {
       let _ = this.update(cx, |_, cx| {
         cx.emit(TerminalEvent::ShellClosed);
       });
+    });
+
+    let blink = cx.spawn(async move |this, cx| {
+      use std::time::Duration;
+      loop {
+        cx.background_executor()
+          .timer(Duration::from_millis(530))
+          .await;
+        let r = this.update(cx, |this, cx| {
+          this.cursor_blink_phase = !this.cursor_blink_phase;
+          cx.notify();
+        });
+        if r.is_err() {
+          break;
+        }
+      }
     });
 
     Self {
@@ -140,8 +163,10 @@ impl TerminalView {
       last_cell_metrics: None,
       scroll_px_acc: 0.0,
       selection: None,
+      cursor_blink_phase: true,
       focus,
       _relay: relay,
+      _blink: blink,
     }
   }
 
@@ -522,6 +547,14 @@ fn is_word_char(c: char) -> bool {
   c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~' | ':')
 }
 
+/// Convert an alacritty-side event into a `TerminalEvent` and emit it.
+fn dispatch_alac_event(event: alacritty_terminal::event::Event, cx: &mut Context<TerminalView>) {
+  use alacritty_terminal::event::Event;
+  if matches!(event, Event::Bell) {
+    cx.emit(TerminalEvent::Bell);
+  }
+}
+
 /// Word bounds (inclusive start, exclusive end) of the run containing
 /// `(row, col)`. Whitespace cells return a single-cell range so the user
 /// still sees feedback. `None` if the cell is out of grid range.
@@ -560,11 +593,10 @@ fn line_bounds(
 }
 
 impl Render for TerminalView {
-  fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-    // Resize is driven by `TerminalElement::prepaint` via `sync_metrics`,
-    // since only the element knows the real per-cell metrics + the real
-    // bounds. The view just hands its current selection down to the
-    // element on each render.
+  fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    let focused = self.focus.is_focused(window);
+    let blink_phase = self.cursor_blink_phase;
+
     div()
       .id("terminal-view")
       .key_context(KEY_CONTEXT)
@@ -584,6 +616,8 @@ impl Render for TerminalView {
         self.terminal.clone(),
         self.selection,
         cx.entity().downgrade(),
+        focused,
+        blink_phase,
       ))
   }
 }
