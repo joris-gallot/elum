@@ -435,19 +435,44 @@ impl TerminalView {
     _window: &mut Window,
     _cx: &mut Context<Self>,
   ) {
-    // Approximate line height - actual paint metrics are computed
-    // inside the element, but for scroll quantization a constant is
-    // close enough. We accumulate fractional pixels so a slow trackpad
-    // wheel still triggers eventual line steps.
-    let line_height = px(FONT_SIZE * LINE_HEIGHT_RATIO);
+    use alacritty_terminal::term::TermMode;
+
+    // Use the real measured line height when available; fall back to the
+    // FONT_SIZE-based heuristic only on the first frame.
+    let line_height = self
+      .last_cell_metrics
+      .map_or_else(|| px(FONT_SIZE * LINE_HEIGHT_RATIO), |(_, h)| h);
     let pixel_y = ev.delta.pixel_delta(line_height).y;
     self.scroll_px_acc += f32::from(pixel_y);
 
     let line_h = f32::from(line_height);
     let lines = (self.scroll_px_acc / line_h) as i32;
-    if lines != 0 {
+    if lines == 0 {
+      return;
+    }
+    self.scroll_px_acc -= lines as f32 * line_h;
+
+    let mode = self.terminal.with_term(|term| *term.mode());
+    // Alt-screen apps (vim, htop, less, man, top, …) keep their own
+    // viewport; the local scrollback is empty there. When the remote
+    // also opted into ALTERNATE_SCROLL, translate wheel deltas into
+    // up/down arrow keystrokes so the app scrolls naturally.
+    if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
+      let app_cursor = mode.contains(TermMode::APP_CURSOR);
+      let key: &[u8] = match (lines.is_positive(), app_cursor) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1b[A",
+        (false, true) => b"\x1bOB",
+        (false, false) => b"\x1b[B",
+      };
+      let count = lines.unsigned_abs() as usize;
+      let mut bytes = Vec::with_capacity(key.len() * count);
+      for _ in 0..count {
+        bytes.extend_from_slice(key);
+      }
+      let _ = self.to_remote.send(bytes);
+    } else {
       self.terminal.scroll_lines(lines);
-      self.scroll_px_acc -= lines as f32 * line_h;
     }
   }
 

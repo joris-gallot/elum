@@ -6,13 +6,19 @@
 use alacritty_terminal::term::TermMode;
 use gpui::Keystroke;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Mods {
   None,
   Alt,
   Ctrl,
   Shift,
+  ShiftAlt,
   CtrlShift,
+  CtrlAlt,
+  ShiftCtrlAlt,
+  /// Anything involving the platform-meta key (Cmd on macOS, Win on
+  /// Linux/Windows). Those are reserved for app-level shortcuts; we
+  /// don't forward them to the PTY.
   Other,
 }
 
@@ -28,9 +34,29 @@ impl Mods {
       (true, false, false, false) => Mods::Alt,
       (false, true, false, false) => Mods::Ctrl,
       (false, false, true, false) => Mods::Shift,
+      (true, false, true, false) => Mods::ShiftAlt,
       (false, true, true, false) => Mods::CtrlShift,
+      (true, true, false, false) => Mods::CtrlAlt,
+      (true, true, true, false) => Mods::ShiftCtrlAlt,
       _ => Mods::Other,
     }
+  }
+
+  /// xterm modifier code in the range 1..=8 used inside CSI sequences
+  /// like `\x1b[1;<code>A`. `1` means no modifier (and is omitted in the
+  /// emitted sequence).
+  fn xterm_code(self) -> Option<u8> {
+    Some(match self {
+      Mods::None => 1,
+      Mods::Shift => 2,
+      Mods::Alt => 3,
+      Mods::ShiftAlt => 4,
+      Mods::Ctrl => 5,
+      Mods::CtrlShift => 6,
+      Mods::CtrlAlt => 7,
+      Mods::ShiftCtrlAlt => 8,
+      Mods::Other => return None,
+    })
   }
 }
 
@@ -75,8 +101,54 @@ pub fn keystroke_to_bytes(ks: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
 
 /// Special-key table for the keys that matter to a daily SSH workflow.
 fn special_key(key: &str, mods: &Mods, mode: TermMode) -> Option<Vec<u8>> {
-  let app_cursor = mode.contains(TermMode::APP_CURSOR);
+  // Plain control keys with no modifier-friendly CSI/SS3 form. Handled
+  // first since they take precedence over any structured dispatch below.
+  if let Some(s) = simple_key(key, mods) {
+    return Some(s);
+  }
 
+  let app_cursor = mode.contains(TermMode::APP_CURSOR);
+  let mod_code = mods.xterm_code()?;
+
+  // Cursor keys: arrows + home/end. Use SS3 when the remote requested
+  // application cursor mode AND no modifiers are held; otherwise fall
+  // back to CSI with an explicit modifier code (1 means "none" and is
+  // emitted bare).
+  if let Some(letter) = cursor_letter(key) {
+    if mod_code == 1 {
+      return Some(if app_cursor {
+        format!("\x1bO{}", letter as char).into_bytes()
+      } else {
+        format!("\x1b[{}", letter as char).into_bytes()
+      });
+    }
+    return Some(format!("\x1b[1;{}{}", mod_code, letter as char).into_bytes());
+  }
+
+  // F1..=F4 use SS3 letters (P/Q/R/S) without modifiers, CSI 1;mod when
+  // modifiers are held.
+  if let Some(letter) = f1_to_f4_letter(key) {
+    if mod_code == 1 {
+      return Some(format!("\x1bO{}", letter as char).into_bytes());
+    }
+    return Some(format!("\x1b[1;{}{}", mod_code, letter as char).into_bytes());
+  }
+
+  // Tilde-style keys: insert/delete/pageup/pagedown/F5..=F12.
+  if let Some(num) = tilde_num(key) {
+    if mod_code == 1 {
+      return Some(format!("\x1b[{num}~").into_bytes());
+    }
+    return Some(format!("\x1b[{num};{mod_code}~").into_bytes());
+  }
+
+  None
+}
+
+/// Plain control keys whose encoding does not follow the CSI/SS3 family
+/// (so the modifier-code machinery doesn't apply). Each variant lists
+/// only the modifier combos that have a meaningful encoding.
+fn simple_key(key: &str, mods: &Mods) -> Option<Vec<u8>> {
   let s: &[u8] = match (key, mods) {
     ("tab", Mods::None) => b"\x09",
     ("tab", Mods::Shift) => b"\x1b[Z",
@@ -89,29 +161,53 @@ fn special_key(key: &str, mods: &Mods, mode: TermMode) -> Option<Vec<u8>> {
     ("backspace", Mods::Alt) => b"\x1b\x7f",
     ("backspace", Mods::Shift) => b"\x7f",
     ("space", Mods::Ctrl) => b"\x00",
-
-    ("home", Mods::None) if app_cursor => b"\x1bOH",
-    ("home", Mods::None) => b"\x1b[H",
-    ("end", Mods::None) if app_cursor => b"\x1bOF",
-    ("end", Mods::None) => b"\x1b[F",
-    ("up", Mods::None) if app_cursor => b"\x1bOA",
-    ("up", Mods::None) => b"\x1b[A",
-    ("down", Mods::None) if app_cursor => b"\x1bOB",
-    ("down", Mods::None) => b"\x1b[B",
-    ("right", Mods::None) if app_cursor => b"\x1bOC",
-    ("right", Mods::None) => b"\x1b[C",
-    ("left", Mods::None) if app_cursor => b"\x1bOD",
-    ("left", Mods::None) => b"\x1b[D",
-
-    ("insert", Mods::None) => b"\x1b[2~",
-    ("delete", Mods::None) => b"\x1b[3~",
-    ("pageup", Mods::None) => b"\x1b[5~",
-    ("pagedown", Mods::None) => b"\x1b[6~",
-
     _ => return None,
   };
-
   Some(s.to_vec())
+}
+
+/// CSI/SS3 final byte for cursor keys.
+fn cursor_letter(key: &str) -> Option<u8> {
+  Some(match key {
+    "up" => b'A',
+    "down" => b'B',
+    "right" => b'C',
+    "left" => b'D',
+    "home" => b'H',
+    "end" => b'F',
+    _ => return None,
+  })
+}
+
+/// SS3 final byte for F1..=F4. F5+ use the tilde-number form.
+fn f1_to_f4_letter(key: &str) -> Option<u8> {
+  Some(match key {
+    "f1" => b'P',
+    "f2" => b'Q',
+    "f3" => b'R',
+    "f4" => b'S',
+    _ => return None,
+  })
+}
+
+/// Number used in `\x1b[<num>~` (or `\x1b[<num>;<mod>~`) for keys whose
+/// encoding follows the tilde family.
+fn tilde_num(key: &str) -> Option<u32> {
+  Some(match key {
+    "insert" => 2,
+    "delete" => 3,
+    "pageup" => 5,
+    "pagedown" => 6,
+    "f5" => 15,
+    "f6" => 17,
+    "f7" => 18,
+    "f8" => 19,
+    "f9" => 20,
+    "f10" => 21,
+    "f11" => 23,
+    "f12" => 24,
+    _ => return None,
+  })
 }
 
 /// Returns true for keys that are named (and shouldn't be passed through as
@@ -319,10 +415,113 @@ mod tests {
   }
 
   #[test]
-  fn unknown_named_key_returns_none() {
-    // The key string "f1" is named-but-unmapped in our subset.
-    // We return None rather than emitting the literal "f1".
-    assert_eq!(keystroke_to_bytes(&ks("f1"), TermMode::empty()), None);
+  fn cmd_modifier_does_not_emit_anything() {
+    // Cmd-arrow is reserved for app-level shortcuts (window/tab nav) and
+    // must never reach the PTY.
+    let mods = Modifiers {
+      platform: true,
+      ..Modifiers::default()
+    };
+    assert_eq!(
+      keystroke_to_bytes(&ks_with("right", mods), TermMode::empty()),
+      None
+    );
+  }
+
+  #[test]
+  fn f1_to_f4_emit_ss3_letters() {
+    let cases = [("f1", "P"), ("f2", "Q"), ("f3", "R"), ("f4", "S")];
+    for (key, letter) in cases {
+      assert_eq!(
+        keystroke_to_bytes(&ks(key), TermMode::empty()),
+        Some(format!("\x1b{}{}", "O", letter).into_bytes()),
+        "{key} should emit SS3 {letter}",
+      );
+    }
+  }
+
+  #[test]
+  fn f5_to_f12_emit_csi_tilde_numbers() {
+    let cases = [
+      ("f5", 15),
+      ("f6", 17),
+      ("f7", 18),
+      ("f8", 19),
+      ("f9", 20),
+      ("f10", 21),
+      ("f11", 23),
+      ("f12", 24),
+    ];
+    for (key, num) in cases {
+      assert_eq!(
+        keystroke_to_bytes(&ks(key), TermMode::empty()),
+        Some(format!("\x1b[{num}~").into_bytes()),
+        "{key} should emit \\x1b[{num}~",
+      );
+    }
+  }
+
+  #[test]
+  fn shift_arrow_emits_csi_with_modifier_code_2() {
+    assert_eq!(
+      keystroke_to_bytes(&ks_with("right", shift()), TermMode::empty()),
+      Some(b"\x1b[1;2C".to_vec())
+    );
+  }
+
+  #[test]
+  fn ctrl_arrow_emits_csi_with_modifier_code_5() {
+    assert_eq!(
+      keystroke_to_bytes(&ks_with("left", ctrl()), TermMode::empty()),
+      Some(b"\x1b[1;5D".to_vec())
+    );
+  }
+
+  #[test]
+  fn ctrl_shift_arrow_emits_csi_with_modifier_code_6() {
+    let mods = Modifiers {
+      control: true,
+      shift: true,
+      ..Modifiers::default()
+    };
+    assert_eq!(
+      keystroke_to_bytes(&ks_with("up", mods), TermMode::empty()),
+      Some(b"\x1b[1;6A".to_vec())
+    );
+  }
+
+  #[test]
+  fn modified_arrow_ignores_app_cursor_mode() {
+    // App-cursor SS3 form has no place to put a modifier code, so we
+    // always fall back to the CSI form when modifiers are pressed.
+    assert_eq!(
+      keystroke_to_bytes(&ks_with("up", shift()), TermMode::APP_CURSOR),
+      Some(b"\x1b[1;2A".to_vec())
+    );
+  }
+
+  #[test]
+  fn shift_pageup_emits_csi_with_modifier_code() {
+    assert_eq!(
+      keystroke_to_bytes(&ks_with("pageup", shift()), TermMode::empty()),
+      Some(b"\x1b[5;2~".to_vec())
+    );
+  }
+
+  #[test]
+  fn shift_f5_emits_csi_with_modifier_code() {
+    assert_eq!(
+      keystroke_to_bytes(&ks_with("f5", shift()), TermMode::empty()),
+      Some(b"\x1b[15;2~".to_vec())
+    );
+  }
+
+  #[test]
+  fn shift_f1_emits_csi_one_two_p() {
+    assert_eq!(
+      keystroke_to_bytes(&ks_with("f1", shift()), TermMode::empty()),
+      Some(b"\x1b[1;2P".to_vec())
+    );
   }
 
   #[test]
