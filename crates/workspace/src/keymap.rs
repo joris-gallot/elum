@@ -17,13 +17,12 @@ use terminal::view::{
 
 pub fn install(cx: &mut App) {
   cx.bind_keys([
-    // Terminal-scoped: only fires when a `TerminalView` is in the focus
-    // chain. Lets us keep app-level Cmd-C/V/A reserved for chrome later.
+    // Terminal-scoped: only fires when a `TerminalView` is in the focus chain
     KeyBinding::new("cmd-c", TerminalCopy, Some(TERMINAL_CONTEXT)),
     KeyBinding::new("cmd-v", TerminalPaste, Some(TERMINAL_CONTEXT)),
     KeyBinding::new("cmd-a", TerminalSelectAll, Some(TERMINAL_CONTEXT)),
     // Workspace-scoped: fires from anywhere in the workspace, including
-    // a focused terminal (action dispatch bubbles outward).
+    // a focused terminal (action dispatch bubbles outward)
     KeyBinding::new("cmd-w", workspace::CloseTab, Some(WORKSPACE_CONTEXT)),
     KeyBinding::new("cmd-shift-]", workspace::NextTab, Some(WORKSPACE_CONTEXT)),
     KeyBinding::new("cmd-shift-[", workspace::PrevTab, Some(WORKSPACE_CONTEXT)),
