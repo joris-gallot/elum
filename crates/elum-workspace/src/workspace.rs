@@ -12,7 +12,9 @@ use serde::Deserialize;
 use tokio::runtime::Runtime;
 
 use crate::host_book::{Host, HostBook};
+use crate::keychain;
 use elum_ui::add_host_dialog::{self, NewHostInput};
+use elum_ui::passphrase_prompt;
 use elum_ui::UiIconName;
 
 actions!(
@@ -112,7 +114,7 @@ impl Workspace {
     }
   }
 
-  fn connect_to_host(&mut self, host_idx: usize, cx: &mut Context<Self>) {
+  fn connect_to_host(&mut self, host_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
     let Some(host) = self.host_book.hosts().get(host_idx).cloned() else {
       return;
     };
@@ -126,29 +128,90 @@ impl Workspace {
     self.active_tab = Some(self.tabs.len() - 1);
     cx.notify();
 
+    let passphrase = if host.passphrase_in_keychain {
+      keychain::fetch(&host.id)
+    } else {
+      None
+    };
+    self.spawn_connect(id, host, passphrase, window, cx);
+  }
+
+  fn spawn_connect(
+    &mut self,
+    tab_id: u64,
+    host: Host,
+    passphrase: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
     let runtime = self.runtime.clone();
-    cx.spawn(async move |this, cx| {
-      // Connect on the tokio runtime, russh requires it. We await
-      // the JoinHandle from inside a GPUI task, which is fine: flume
-      // and tokio JoinHandles are runtime-agnostic at the await-site.
+    cx.spawn_in(window, async move |this, cx| {
+      let host_for_task = host.clone();
+      let pass_for_task = passphrase.clone();
       let join = runtime.spawn(async move {
-        let cfg = ConnectConfig::new(&host.host, host.port, &host.user, &host.key_path);
+        let mut cfg = ConnectConfig::new(
+          &host_for_task.host,
+          host_for_task.port,
+          &host_for_task.user,
+          &host_for_task.key_path,
+        );
+        cfg.key_passphrase = pass_for_task;
         let session = Session::connect(&cfg).await?;
         let shell = session.open_shell(INITIAL_COLS, INITIAL_ROWS).await?;
         Ok::<ShellHandle, anyhow::Error>(shell)
       });
 
-      let shell_result = match join.await {
-        Ok(Ok(shell)) => Ok(shell),
-        Ok(Err(e)) => Err(format!("{e:#}")),
-        Err(e) => Err(format!("task join error: {e}")),
-      };
-
-      let _ = this.update(cx, move |this, cx| {
-        this.finalize_tab(id, shell_result, cx);
-      });
+      match join.await {
+        Ok(Ok(shell)) => {
+          let _ = this.update(cx, move |this, cx| {
+            this.finalize_tab(tab_id, Ok(shell), cx);
+          });
+        }
+        Ok(Err(err)) => {
+          if is_encrypted_key_error(&err) {
+            let _ = this.update_in(cx, move |_this, window, cx| {
+              let view = cx.entity().downgrade();
+              let host_name = host.name.clone();
+              passphrase_prompt::open(window, cx, host_name, move |submit, window, cx| {
+                let host = host.clone();
+                let _ = view.update(cx, |this, cx| {
+                  if submit.save_in_keychain {
+                    match keychain::store(&host.id, &submit.passphrase) {
+                      Ok(()) => this.mark_passphrase_saved(&host.id),
+                      Err(e) => eprintln!("warning: keychain store for {} failed: {e:#}", host.id),
+                    }
+                  }
+                  this.spawn_connect(tab_id, host, Some(submit.passphrase), window, cx);
+                });
+              });
+            });
+          } else {
+            let msg = format!("{err:#}");
+            let _ = this.update(cx, move |this, cx| {
+              this.finalize_tab(tab_id, Err(msg), cx);
+            });
+          }
+        }
+        Err(e) => {
+          let msg = format!("task join error: {e}");
+          let _ = this.update(cx, move |this, cx| {
+            this.finalize_tab(tab_id, Err(msg), cx);
+          });
+        }
+      }
     })
     .detach();
+  }
+
+  fn mark_passphrase_saved(&mut self, host_id: &str) {
+    if let Some(idx) = self.host_book.hosts().iter().position(|h| h.id == host_id) {
+      let mut host = self.host_book.hosts()[idx].clone();
+      if !host.passphrase_in_keychain {
+        host.passphrase_in_keychain = true;
+        self.host_book.replace(idx, host);
+        self.persist_host_book();
+      }
+    }
   }
 
   fn finalize_tab(
@@ -228,18 +291,23 @@ impl Workspace {
     cx.quit();
   }
 
-  /// Submit handler for the Add Host dialog. Owns ID generation and
-  /// persistence so the dialog itself stays domain-agnostic. Persists
-  /// immediately so a crash before the next save doesn't lose the
-  /// user's entry.
   pub(crate) fn add_host_from_dialog(&mut self, input: NewHostInput, cx: &mut Context<Self>) {
+    let id = generate_host_id();
+    let mut passphrase_in_keychain = false;
+    if let Some(p) = input.key_passphrase.as_deref() {
+      match keychain::store(&id, p) {
+        Ok(()) => passphrase_in_keychain = true,
+        Err(e) => eprintln!("warning: keychain store for {id} failed: {e:#}"),
+      }
+    }
     let host = Host {
-      id: generate_host_id(),
+      id,
       name: input.name,
       host: input.host,
       port: input.port,
       user: input.user,
       key_path: input.key_path,
+      passphrase_in_keychain,
     };
     self.host_book.add(host);
     self.persist_host_book();
@@ -255,27 +323,34 @@ impl Workspace {
     let Some(idx) = self.host_book.hosts().iter().position(|h| h.id == host_id) else {
       return;
     };
-    let existing_id = self.host_book.hosts()[idx].id.clone();
+    let existing = &self.host_book.hosts()[idx];
+    let id = existing.id.clone();
+    let mut passphrase_in_keychain = existing.passphrase_in_keychain;
+    if let Some(p) = input.key_passphrase.as_deref() {
+      match keychain::store(&id, p) {
+        Ok(()) => passphrase_in_keychain = true,
+        Err(e) => eprintln!("warning: keychain store for {id} failed: {e:#}"),
+      }
+    }
     let host = Host {
-      id: existing_id,
+      id,
       name: input.name,
       host: input.host,
       port: input.port,
       user: input.user,
       key_path: input.key_path,
+      passphrase_in_keychain,
     };
     self.host_book.replace(idx, host);
     self.persist_host_book();
     cx.notify();
   }
 
-  /// Confirmed deletion: drops the host from the book and persists. Open
-  /// tabs that reference this host stay open — they own their own
-  /// connection state, no need to tear them down here.
   pub(crate) fn remove_host_by_id(&mut self, host_id: &str, cx: &mut Context<Self>) {
     let Some(idx) = self.host_book.hosts().iter().position(|h| h.id == host_id) else {
       return;
     };
+    keychain::delete(host_id);
     self.host_book.remove(idx);
     self.persist_host_book();
     cx.notify();
@@ -298,6 +373,7 @@ impl Workspace {
       port: host.port,
       user: host.user.clone(),
       key_path: host.key_path.clone(),
+      key_passphrase: None,
     };
     let view = cx.entity().downgrade();
     add_host_dialog::open(window, cx, Some(initial), move |input, cx| {
@@ -389,9 +465,9 @@ impl Workspace {
         let view_for_click = view.clone();
         let host_id = SharedString::from(host.id.clone());
         SidebarMenuItem::new(SharedString::from(host.name.clone()))
-          .on_click(move |_, _window, cx| {
+          .on_click(move |_, window, cx| {
             let _ = view_for_click.update(cx, |this, cx| {
-              this.connect_to_host(i, cx);
+              this.connect_to_host(i, window, cx);
             });
           })
           .context_menu(move |menu, _, _| {
@@ -553,6 +629,15 @@ impl Render for Workspace {
           .child(main),
       )
   }
+}
+
+/// True when the connect failure was caused by a missing/wrong passphrase
+/// for an encrypted key. Matched on the error chain since russh wraps the
+/// `russh::keys::Error::KeyIsEncrypted` variant inside an anyhow context.
+fn is_encrypted_key_error(err: &anyhow::Error) -> bool {
+  err
+    .chain()
+    .any(|cause| cause.to_string().contains("The key is encrypted"))
 }
 
 /// Generate a stable-enough host ID from the wall clock

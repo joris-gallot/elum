@@ -17,6 +17,7 @@ pub struct NewHostInput {
   pub port: u16,
   pub user: String,
   pub key_path: PathBuf,
+  pub key_passphrase: Option<String>,
 }
 
 pub fn open<F>(window: &mut Window, cx: &mut App, initial: Option<NewHostInput>, on_submit: F)
@@ -37,6 +38,7 @@ where
   let key_default = initial
     .as_ref()
     .map(|i| i.key_path.to_string_lossy().to_string());
+  let passphrase_default = initial.as_ref().and_then(|i| i.key_passphrase.clone());
 
   let name = cx.new(|cx| {
     let s = InputState::new(window, cx).placeholder("My VPS");
@@ -72,12 +74,24 @@ where
     }
   });
 
+  let passphrase = cx.new(|cx| {
+    let s = InputState::new(window, cx)
+      .masked(true)
+      .placeholder("Leave empty if key is unencrypted");
+    if let Some(v) = passphrase_default {
+      s.default_value(v)
+    } else {
+      s
+    }
+  });
+
   window.open_dialog(cx, move |dialog, _, _| {
     let name = name.clone();
     let host = host.clone();
     let port = port.clone();
     let user = user.clone();
     let key = key.clone();
+    let passphrase = passphrase.clone();
     let on_submit = on_submit.clone();
 
     let body = v_form()
@@ -110,6 +124,11 @@ where
           .label("Key path")
           .required(true)
           .child(Input::new(&key)),
+      )
+      .child(
+        field()
+          .label("Key passphrase")
+          .child(Input::new(&passphrase)),
       );
 
     dialog
@@ -131,6 +150,7 @@ where
         };
         let user_v = read_value(&user, cx);
         let key_v = read_value(&key, cx);
+        let passphrase_v = read_value(&passphrase, cx);
 
         if name_v.is_empty() || host_v.is_empty() || user_v.is_empty() || key_v.is_empty() {
           return false;
@@ -142,6 +162,11 @@ where
           port: port_v,
           user: user_v,
           key_path: PathBuf::from(key_v),
+          key_passphrase: if passphrase_v.is_empty() {
+            None
+          } else {
+            Some(passphrase_v)
+          },
         };
         on_submit(input, cx);
         true

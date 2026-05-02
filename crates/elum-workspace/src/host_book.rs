@@ -13,15 +13,16 @@
 //!       "host": "127.0.0.1",
 //!       "port": 2222,
 //!       "user": "testuser",
-//!       "key_path": "/abs/path/to/id_ed25519"
+//!       "key_path": "/abs/path/to/id_ed25519",
+//!       "passphrase_in_keychain": false
 //!     }
 //!   ]
 //! }
 //! ```
 //!
-//! Schema-version is on disk so we can migrate forward without breaking
-//! older user files. Loading an unknown version is treated as an error so
-//! we never silently drop user state.
+//! Passphrases are never written to this file. When `passphrase_in_keychain`
+//! is `true`, the actual secret lives in the OS keychain under service
+//! `com.elum.host.{id}` / account `passphrase`.
 
 use std::fs;
 use std::io;
@@ -30,8 +31,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// One configured SSH endpoint. Identified by `id` so tabs can survive
-/// rename/edit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Host {
   pub id: String,
@@ -40,10 +39,10 @@ pub struct Host {
   pub port: u16,
   pub user: String,
   pub key_path: PathBuf,
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub passphrase_in_keychain: bool,
 }
 
-/// Container for the on-disk file. Schema-version on the wire so the next
-/// migration doesn't have to guess.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HostBookFile {
   version: u32,
@@ -52,16 +51,13 @@ struct HostBookFile {
 
 const SCHEMA_VERSION: u32 = 1;
 
-/// Live, in-memory host book. The path is kept for `save()`.
 #[derive(Debug)]
 pub struct HostBook {
   path: PathBuf,
   hosts: Vec<Host>,
 }
 
-#[allow(dead_code)] // Several methods are public surface for the future
-                    // edit-host UI; binary crates flag pub-but-unreached as
-                    // dead, so we silence the lint at the impl block.
+#[allow(dead_code)]
 impl HostBook {
   /// Standard location: `~/Library/Application Support/elum/hosts.json` on
   /// macOS, `$XDG_CONFIG_HOME/elum/hosts.json` on Linux. Falls back to a
@@ -101,7 +97,6 @@ impl HostBook {
     }
   }
 
-  /// Convenience wrapper around the OS default path.
   pub fn load_default() -> Result<Self> {
     Self::load_from(Self::default_path())
   }
@@ -122,22 +117,16 @@ impl HostBook {
     self.hosts.push(host);
   }
 
-  /// Replace the host at `index`, panicking if out of bounds.
   pub fn replace(&mut self, index: usize, host: Host) {
     self.hosts[index] = host;
   }
 
-  /// Remove the host at `index`. No-op if `index` is out of bounds,
-  /// safer than panic for UI-driven calls.
   pub fn remove(&mut self, index: usize) {
     if index < self.hosts.len() {
       self.hosts.remove(index);
     }
   }
 
-  /// Persist the current state to disk. Creates parent directories as
-  /// needed; writes atomically through a sibling temp file + rename so a
-  /// crash mid-write can't corrupt the user's host list.
   pub fn save(&self) -> Result<()> {
     if let Some(parent) = self.path.parent() {
       fs::create_dir_all(parent)
@@ -150,8 +139,6 @@ impl HostBook {
     };
     let text = serde_json::to_string_pretty(&file).context("serializing host book")?;
 
-    // Atomic write: write to a sibling temp file then rename over the
-    // target so a crash never leaves a half-written hosts.json.
     let tmp = self.path.with_extension("json.tmp");
     fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, &self.path)
@@ -174,6 +161,7 @@ mod tests {
       port: 22,
       user: "user".into(),
       key_path: PathBuf::from("/dev/null"),
+      passphrase_in_keychain: false,
     }
   }
 

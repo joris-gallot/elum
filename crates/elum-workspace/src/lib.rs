@@ -1,4 +1,5 @@
 pub mod host_book;
+pub mod keychain;
 pub mod keymap;
 pub mod workspace;
 
