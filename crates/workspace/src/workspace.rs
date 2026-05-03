@@ -1061,7 +1061,6 @@ fn purge_obsolete_keychain_entries(prev: &HostAuth, new: &NewAuth, host_id: &str
 fn generate_host_id() -> String {
   let ms = SystemTime::now()
     .duration_since(UNIX_EPOCH)
-    .map(|d| d.as_millis())
-    .unwrap_or(0);
+    .map_or(0, |d| d.as_millis());
   format!("host-{ms}")
 }
