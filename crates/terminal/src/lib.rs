@@ -215,16 +215,12 @@ impl Terminal {
     term.selection = Some(sel);
   }
 
-  /// RGB value for a terminal color request. Runtime OSC color overrides
-  /// stored by alacritty win over our static fallback palette.
-  pub fn color_rgb(&self, index: usize) -> alacritty_terminal::vte::ansi::Rgb {
-    self.with_term(|term| {
-      if index < color::COUNT {
-        term.colors()[index].unwrap_or_else(|| crate::colors::color_index_rgb(index))
-      } else {
-        crate::colors::default_foreground_rgb()
-      }
-    })
+  /// Runtime OSC override for a palette slot, `None` if the slot is at its theme default.
+  pub fn osc_color_override(&self, index: usize) -> Option<alacritty_terminal::vte::ansi::Rgb> {
+    if index >= color::COUNT {
+      return None;
+    }
+    self.with_term(|term| term.colors()[index])
   }
 
   /// Snapshot every visible cell with its style flags, plus the cursor

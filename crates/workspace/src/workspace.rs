@@ -601,10 +601,7 @@ impl Workspace {
       return;
     }
     self.view = WorkspaceView::Page(page);
-    // Focus the page-scoped handle so the `Page` key context lands in
-    // the focus chain, even before the user clicks any inner widget —
-    // otherwise `Escape` → `ClosePage` only fires once a child input
-    // (e.g. the settings search box) is focused.
+    // Focus the page handle so `Escape` -> ClosePage fires before any inner widget is focused.
     window.focus(&self.page_focus, cx);
     cx.notify();
   }
@@ -871,10 +868,7 @@ impl Workspace {
     bar.into_any_element()
   }
 
-  /// Wrap any [`Page`] in the shared full-screen chrome: title on the
-  /// left, close `X` on the right, then the page's own content. The
-  /// wrapper sets [`PAGE_KEY_CONTEXT`] so the keymap can route `Escape`
-  /// to [`ClosePage`].
+  /// Shared full-screen chrome: title + close X, sets [`PAGE_KEY_CONTEXT`] for Escape.
   fn render_page(&self, page: Page, cx: &mut Context<Self>) -> AnyElement {
     let theme = cx.theme();
     let entity = cx.entity().downgrade();

@@ -7,7 +7,8 @@
 //! {
 //!   "version": 1,
 //!   "theme_mode": "dark",
-//!   "auto_switch_theme": false
+//!   "auto_switch_theme": false,
+//!   "terminal_theme": "one_dark"
 //! }
 //! ```
 
@@ -17,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use terminal::colors::TerminalThemeId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,6 +35,8 @@ struct AppSettingsFile {
   theme_mode: ThemeMode,
   #[serde(default)]
   auto_switch_theme: bool,
+  #[serde(default)]
+  terminal_theme: TerminalThemeId,
 }
 
 const SCHEMA_VERSION: u32 = 1;
@@ -42,6 +46,7 @@ pub struct AppSettings {
   path: PathBuf,
   pub theme_mode: ThemeMode,
   pub auto_switch_theme: bool,
+  pub terminal_theme: TerminalThemeId,
 }
 
 impl gpui::Global for AppSettings {}
@@ -52,6 +57,7 @@ impl Default for AppSettings {
       path: Self::default_path(),
       theme_mode: ThemeMode::default(),
       auto_switch_theme: false,
+      terminal_theme: TerminalThemeId::default(),
     }
   }
 }
@@ -81,12 +87,14 @@ impl AppSettings {
           path,
           theme_mode: file.theme_mode,
           auto_switch_theme: file.auto_switch_theme,
+          terminal_theme: file.terminal_theme,
         })
       }
       Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self {
         path,
         theme_mode: ThemeMode::default(),
         auto_switch_theme: false,
+        terminal_theme: TerminalThemeId::default(),
       }),
       Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
@@ -102,6 +110,7 @@ impl AppSettings {
       version: SCHEMA_VERSION,
       theme_mode: self.theme_mode,
       auto_switch_theme: self.auto_switch_theme,
+      terminal_theme: self.terminal_theme,
     };
     let text = serde_json::to_string_pretty(&file).context("serializing app settings")?;
 
@@ -125,6 +134,7 @@ mod tests {
     let settings = AppSettings::load_from(&path).expect("load");
     assert_eq!(settings.theme_mode, ThemeMode::Dark);
     assert!(!settings.auto_switch_theme);
+    assert_eq!(settings.terminal_theme, TerminalThemeId::default());
   }
 
   #[test]
@@ -134,21 +144,24 @@ mod tests {
     let mut settings = AppSettings::load_from(&path).unwrap();
     settings.theme_mode = ThemeMode::Light;
     settings.auto_switch_theme = true;
+    settings.terminal_theme = TerminalThemeId::Dracula;
     settings.save().unwrap();
 
     let reloaded = AppSettings::load_from(&path).unwrap();
     assert_eq!(reloaded.theme_mode, ThemeMode::Light);
     assert!(reloaded.auto_switch_theme);
+    assert_eq!(reloaded.terminal_theme, TerminalThemeId::Dracula);
   }
 
   #[test]
-  fn legacy_file_without_auto_field_defaults_to_false() {
+  fn legacy_file_without_new_fields_defaults_them() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("settings.json");
     fs::write(&path, r#"{"version":1,"theme_mode":"light"}"#).unwrap();
     let settings = AppSettings::load_from(&path).expect("load");
     assert_eq!(settings.theme_mode, ThemeMode::Light);
     assert!(!settings.auto_switch_theme);
+    assert_eq!(settings.terminal_theme, TerminalThemeId::default());
   }
 
   #[test]

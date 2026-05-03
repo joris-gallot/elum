@@ -33,7 +33,7 @@ pub enum TerminalEvent {
   TitleChanged(Option<String>),
 }
 
-use crate::colors::{default_background, default_foreground};
+use crate::colors::TerminalTheme;
 use crate::element::TerminalElement;
 use crate::keys::keystroke_to_bytes;
 use crate::mouse::{
@@ -450,15 +450,12 @@ impl TerminalView {
     ev: &ScrollWheelEvent,
     cx: &mut Context<Self>,
   ) {
-    // Use the real measured line height when available; fall back to the
-    // FONT_SIZE-based heuristic only on the first frame.
+    // Fall back to the FONT_SIZE heuristic only on the first frame.
     let line_height = self
       .last_cell_metrics
       .map_or_else(|| px(FONT_SIZE * LINE_HEIGHT_RATIO), |(_, h)| h);
 
-    // Reset the residual at the start of a fresh trackpad gesture. Without
-    // this, leftover sub-line offset (up to ~1 line) from the previous
-    // gesture would jump the viewport on the first event of the next.
+    // Reset residual on a fresh gesture so the previous gesture's leftover doesn't jump us.
     if matches!(ev.touch_phase, TouchPhase::Started) {
       self.scroll_px_acc = 0.0;
     }
@@ -491,27 +488,19 @@ impl TerminalView {
           bytes.extend_from_slice(&report);
         }
         let _ = self.to_remote.send(bytes);
-        // Mouse-mode reporting: the remote owns the viewport. Don't
-        // carry a sub-line offset that would visually shift the grid.
+        // Remote owns the viewport; sub-line offset would visually misalign.
         self.scroll_px_acc = 0.0;
       } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) {
-        // Alt-screen apps (vim, htop, less, man, top, …) keep their own
-        // viewport; the local scrollback is empty there. When the remote
-        // also opted into ALTERNATE_SCROLL, translate wheel deltas into
-        // up/down arrow keystrokes so the app scrolls naturally.
+        // Alt-screen apps (vim, less, htop) redraw in place; translate wheel to arrow keys.
         let bytes = alt_scroll(lines, mode.contains(TermMode::APP_CURSOR));
         let _ = self.to_remote.send(bytes);
-        // Same rationale as mouse-mode: remote app redraws in place.
         self.scroll_px_acc = 0.0;
       } else {
         self.terminal.scroll_lines(lines);
       }
     }
 
-    // Edge clamp for normal scrollback: at the top of history a positive
-    // residual would peek empty space above; at the live bottom a negative
-    // residual would peek empty space below. Drop the residual at the edge
-    // so the viewport rests cleanly on the grid.
+    // Drop residual at the scrollback edge so we don't peek empty space.
     if !self.is_remote_owned_scroll(mode) {
       let display_offset = self.terminal.display_offset();
       let history_size = self.terminal.history_size();
@@ -530,9 +519,7 @@ impl TerminalView {
       || mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
   }
 
-  /// Sub-line vertical paint offset, in pixels. Positive shifts the grid
-  /// downward (history peeking from top); negative shifts upward. Always
-  /// in `(-line_h, line_h)` and zero outside normal scrollback mode.
+  /// Sub-line paint offset in pixels, in `(-line_h, line_h)`.
   pub(crate) fn scroll_offset_y(&self) -> f32 {
     self.scroll_px_acc
   }
@@ -594,11 +581,21 @@ impl TerminalView {
       None
     };
 
+    let theme = cx
+      .try_global::<TerminalTheme>()
+      .copied()
+      .unwrap_or_default();
     let effects = alacritty_event_effects(
       event,
       self.current_window_size(),
       clipboard_text.as_deref(),
-      |index| self.terminal.color_rgb(index),
+      // Runtime OSC overrides win over the theme palette.
+      |index| {
+        self
+          .terminal
+          .osc_color_override(index)
+          .unwrap_or_else(|| theme.color_index_rgb(index))
+      },
     );
 
     for bytes in effects.remote_writes {
@@ -727,6 +724,10 @@ impl Render for TerminalView {
   fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
     let focused = self.focus.is_focused(window);
     let blink_phase = self.cursor_blink_phase;
+    let theme = cx
+      .try_global::<TerminalTheme>()
+      .copied()
+      .unwrap_or_default();
 
     div()
       .id("terminal-view")
@@ -737,8 +738,8 @@ impl Render for TerminalView {
       .on_action(cx.listener(Self::on_select_all))
       .on_key_down(cx.listener(Self::handle_key_down))
       .size_full()
-      .bg(default_background())
-      .text_color(default_foreground())
+      .bg(theme.background)
+      .text_color(theme.foreground)
       .font_family(FONT_FAMILY)
       .text_size(px(FONT_SIZE))
       .p(px(PADDING))

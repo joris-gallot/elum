@@ -13,6 +13,7 @@ flume = "0.11"
 polling = "3"
 parking_lot = "0.12"
 anyhow = "1"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }

@@ -1,21 +1,10 @@
-//! Custom GPUI `Element` for the terminal grid.
+//! Custom GPUI `Element` for the terminal grid: prepaint snapshots and measures, paint
+//! emits background quads + one shaped line per row + cursor.
 //!
-//! Layout claims the full
-//! parent area, prepaint snapshots the grid and measures the cell from real
-//! font metrics, paint emits one batch of background quads followed by one
-//! shaped text line per row plus the cursor block.
-//!
-//! Design notes:
-//! - Cell width is the advance of `'M'` in the cascaded font. We force every
-//!   glyph to that advance via `shape_line(.., Some(cell_width))`. CJK and
-//!   emoji are squished to one cell each - fine for a terminal client; the
-//!   downside is purely aesthetic.
-//! - Adjacent cells with identical style attributes (fg, bold, italic,
-//!   underline) are coalesced into a single `TextRun` to keep the run
-//!   array small. Backgrounds are painted as separate quads underneath.
-//! - The cursor is painted as a single quad in cursor color; the glyph
-//!   under it is rendered with the original background color so it stays
-//!   legible against the bright block.
+//! Cell width is the advance of `'M'`; every glyph is forced to that advance
+//! (CJK/emoji squished). Adjacent cells with identical style coalesce into a
+//! single `TextRun`. Filled cursor is painted as a bg quad with its glyph
+//! recolored to the cell bg for contrast.
 
 use std::sync::Arc;
 
@@ -29,9 +18,7 @@ use gpui::{
   Style, TextAlign, TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity, Window,
 };
 
-use crate::colors::{
-  cursor_color, default_background, default_foreground, selection_color, to_rgba,
-};
+use crate::colors::TerminalTheme;
 use crate::view::TerminalView;
 use crate::{CellSnapshot, GridSnapshot, Terminal};
 
@@ -136,15 +123,13 @@ impl Element for TerminalElement {
     let line_height = px(f32::from(font_size) * LINE_HEIGHT_RATIO);
 
     let font_id = cx.text_system().resolve_font(&text_style.font());
-    // Use 'M' for cell width, broadest representative ASCII glyph in most monospace fonts.
+    // 'M' is the broadest representative ASCII glyph in most monospace fonts.
     let cell_width = cx
       .text_system()
       .advance(font_id, font_size, 'M')
       .map_or_else(|_| px(f32::from(font_size) * 0.6), |adv| adv.width);
 
-    // Sync the grid size + PTY size to the *real* bounds we got from
-    // layout, using the *real* cell metrics. This must happen before we
-    // snapshot the grid so the snapshot reflects the post-resize state.
+    // Must happen before snapshot_grid so the snapshot reflects the post-resize state.
     let _ = self.view.update(cx, |view, _| {
       view.sync_metrics(cell_width, line_height, bounds);
     });
@@ -180,10 +165,7 @@ impl Element for TerminalElement {
     let snapshot = &prepaint.snapshot;
     let cursor_kind = resolve_cursor_kind(snapshot, self.focused, self.blink_phase);
 
-    // Sub-line vertical offset for smooth scroll. Positive = grid shifted
-    // down (history peek from top); negative = grid shifted up (recent
-    // content peek from bottom). Pulled fresh from the view so
-    // `cx.notify()` after a sub-line accumulator change drives a repaint.
+    // Sub-line vertical paint offset for smooth scroll: positive = grid shifted down.
     let sub_y = self
       .view
       .upgrade()
@@ -191,6 +173,10 @@ impl Element for TerminalElement {
 
     let mut origin = prepaint.origin;
     origin.y += sub_y;
+    let theme = cx
+      .try_global::<TerminalTheme>()
+      .copied()
+      .unwrap_or_default();
     let ctx = PaintCtx {
       origin,
       cell_w: prepaint.cell_width,
@@ -200,28 +186,20 @@ impl Element for TerminalElement {
       cursor_filled: cursor_kind == CursorKind::Filled,
       selection: snapshot.selection,
       display_offset: snapshot.display_offset,
-      fg_default: default_foreground(),
-      bg_default: default_background(),
-      cursor_bg: cursor_color(),
-      sel_bg: selection_color(),
+      bg_default: theme.background,
+      cursor_bg: theme.cursor,
+      sel_bg: theme.selection,
+      theme: &theme,
       text_style: &prepaint.text_style,
     };
 
-    // Window background - cells without explicit bg paint over this.
-    // Painted unclipped so the terminal frame stays solid even when
-    // sub-line offset would otherwise expose a strip at top or bottom.
+    // Painted unclipped so the frame stays solid when sub-line offset exposes top/bottom strips.
     window.paint_quad(fill(bounds, ctx.bg_default));
 
-    // Everything that follows is content that may extend past the viewport
-    // by up to one row of overscan; clip it to the terminal bounds so it
-    // doesn't bleed into neighboring tabs / panes during sub-line scroll.
+    // Clip overscan rows to the terminal bounds so they don't bleed during sub-line scroll.
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
       let n_rows = snapshot.rows.len() as i32;
 
-      // Pass 1: background quads. We coalesce horizontally adjacent cells
-      // with the same effective bg into a single quad; reduces draw calls
-      // and avoids hairlines between identical neighbors. Filled cursor
-      // is rendered as bg here so adjacent same-bg cells coalesce.
       if let Some(row) = snapshot.overscan_top.as_deref() {
         paint_row_backgrounds(&ctx, -1, row, window);
       }
@@ -232,8 +210,6 @@ impl Element for TerminalElement {
         paint_row_backgrounds(&ctx, n_rows, row, window);
       }
 
-      // Pass 2: shape and paint the row text. One `shape_line` per row,
-      // with adjacent same-style cells coalesced into shared TextRuns.
       if let Some(row) = snapshot.overscan_top.as_deref() {
         paint_row_text(&ctx, -1, row, window, cx);
       }
@@ -244,10 +220,8 @@ impl Element for TerminalElement {
         paint_row_text(&ctx, n_rows, row, window, cx);
       }
 
-      // Pass 3: non-filled cursor decorations (hollow border, beam, underline).
       paint_cursor_overlay(cursor_kind, &ctx, window);
 
-      // Pass 4: marked text overlay if the IME is composing.
       if let Some(view) = self.view.upgrade() {
         let marked = view.read(cx).marked_text().map(str::to_owned);
         if let Some(text) = marked {
@@ -262,11 +236,8 @@ impl Element for TerminalElement {
 }
 
 impl TerminalElement {
-  /// Register window-level mouse listeners for the next frame, dispatching
-  /// element-local positions back into the [`TerminalView`]. Done here
-  /// rather than on a wrapper div so we can subtract the hitbox origin
-  /// and so the dispatcher respects z-order (overlays above the terminal
-  /// will not see clicks reach us).
+  /// Window-level mouse listeners. Done here (not on a wrapper div) so element-local
+  /// positions subtract the hitbox origin and z-order is respected (overlays block clicks).
   fn register_mouse_listeners(&self, hitbox: Hitbox, window: &mut Window) {
     let down_view = self.view.clone();
     let down_hitbox = hitbox.clone();
@@ -376,10 +347,10 @@ struct PaintCtx<'a> {
   cursor_filled: bool,
   selection: Option<alacritty_terminal::selection::SelectionRange>,
   display_offset: usize,
-  fg_default: Rgba,
   bg_default: Rgba,
   cursor_bg: Rgba,
   sel_bg: Rgba,
+  theme: &'a TerminalTheme,
   text_style: &'a TextStyle,
 }
 
@@ -515,7 +486,7 @@ fn paint_row_backgrounds(
   let mut run_color: Rgba = ctx.bg_default;
 
   for (col, cell) in row.iter().enumerate() {
-    let bg = effective_bg(cell, ctx.fg_default, ctx.bg_default);
+    let bg = effective_bg(cell, ctx.theme);
     let is_cursor = ctx.cursor_filled && row_for_cursor.is_some_and(|r| ctx.cursor == (r, col));
     let is_selected = ctx.selection.is_some_and(|range| {
       let here = range.contains(AlacPoint::new(grid_line, Column(col)));
@@ -602,13 +573,7 @@ fn paint_row_text(
     let glyph_byte_len = glyph_str.len();
 
     let is_cursor = ctx.cursor_filled && row_for_cursor.is_some_and(|r| ctx.cursor == (r, col));
-    let style = row_run_style(
-      cell,
-      is_cursor,
-      ctx.text_style,
-      ctx.fg_default,
-      ctx.bg_default,
-    );
+    let style = row_run_style(cell, is_cursor, ctx.text_style, ctx.theme);
 
     match &current_style {
       Some(s) if s == &style => {
@@ -648,9 +613,9 @@ fn paint_row_text(
 
 /// Effective background for a cell, accounting for `inverse`. Cursor
 /// override is applied later.
-fn effective_bg(cell: &CellSnapshot, fg_default: Rgba, bg_default: Rgba) -> Rgba {
-  let cell_fg = to_rgba(cell.fg, fg_default, bg_default);
-  let cell_bg = to_rgba(cell.bg, fg_default, bg_default);
+fn effective_bg(cell: &CellSnapshot, theme: &TerminalTheme) -> Rgba {
+  let cell_fg = theme.to_rgba(cell.fg);
+  let cell_bg = theme.to_rgba(cell.bg);
   if cell.inverse {
     cell_fg
   } else {
@@ -703,11 +668,10 @@ fn row_run_style(
   cell: &CellSnapshot,
   is_cursor: bool,
   _base: &TextStyle,
-  fg_default: Rgba,
-  bg_default: Rgba,
+  theme: &TerminalTheme,
 ) -> RowRunStyle {
-  let cell_fg = to_rgba(cell.fg, fg_default, bg_default);
-  let cell_bg = to_rgba(cell.bg, fg_default, bg_default);
+  let cell_fg = theme.to_rgba(cell.fg);
+  let cell_bg = theme.to_rgba(cell.bg);
   let (mut fg, _bg) = if cell.inverse {
     (cell_bg, cell_fg)
   } else {

@@ -1,8 +1,10 @@
-use gpui::App;
+use gpui::{App, SharedString};
 use gpui_component::setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings};
+use terminal::colors::{TerminalTheme, TerminalThemeId};
 
 use crate::app_settings::{AppSettings, ThemeMode};
 
+/// Push settings into the live `gpui_component::Theme` and `TerminalTheme` globals.
 pub fn apply_theme(settings: &AppSettings, cx: &mut App) {
   if settings.auto_switch_theme {
     gpui_component::Theme::sync_system_appearance(None, cx);
@@ -13,10 +15,9 @@ pub fn apply_theme(settings: &AppSettings, cx: &mut App) {
     };
     gpui_component::Theme::change(mode, None, cx);
   }
+  cx.set_global::<TerminalTheme>(settings.terminal_theme.theme());
 }
 
-/// Update one field on the global `AppSettings`, re-apply the theme, refresh
-/// every window, and persist the new settings to disk
 fn update_settings_and_apply(cx: &mut App, mutate: impl FnOnce(&mut AppSettings)) {
   let settings_to_save = {
     let settings = cx.global_mut::<AppSettings>();
@@ -31,7 +32,6 @@ fn update_settings_and_apply(cx: &mut App, mutate: impl FnOnce(&mut AppSettings)
 }
 
 pub(crate) fn settings(_cx: &mut App) -> Settings {
-  // Switch: ON = Dark mode, OFF = Light mode.
   let dark_mode_field = SettingField::switch(
     |cx: &App| matches!(cx.global::<AppSettings>().theme_mode, ThemeMode::Dark),
     |on: bool, cx: &mut App| {
@@ -48,7 +48,6 @@ pub(crate) fn settings(_cx: &mut App) -> Settings {
     },
   );
 
-  // Checkbox: when enabled, theme follows the OS appearance.
   let auto_field = SettingField::checkbox(
     |cx: &App| cx.global::<AppSettings>().auto_switch_theme,
     |on: bool, cx: &mut App| {
@@ -56,6 +55,22 @@ pub(crate) fn settings(_cx: &mut App) -> Settings {
         return;
       }
       update_settings_and_apply(cx, |settings| settings.auto_switch_theme = on);
+    },
+  );
+
+  let terminal_theme_options: Vec<(SharedString, SharedString)> = TerminalThemeId::all()
+    .iter()
+    .map(|id| (id.slug().into(), id.label().into()))
+    .collect();
+  let terminal_theme_field = SettingField::dropdown(
+    terminal_theme_options,
+    |cx: &App| -> SharedString { cx.global::<AppSettings>().terminal_theme.slug().into() },
+    |val: SharedString, cx: &mut App| {
+      let new_id = TerminalThemeId::from_slug(val.as_ref());
+      if cx.global::<AppSettings>().terminal_theme == new_id {
+        return;
+      }
+      update_settings_and_apply(cx, |settings| settings.terminal_theme = new_id);
     },
   );
 
@@ -69,6 +84,10 @@ pub(crate) fn settings(_cx: &mut App) -> Settings {
     .item(
       SettingItem::new("Auto switch theme", auto_field)
         .description("Follow the system appearance instead of the manual choice above."),
+    )
+    .item(
+      SettingItem::new("Terminal theme", terminal_theme_field)
+        .description("Color palette used by the terminal grid (foreground, background, ANSI 16)."),
     );
 
   let general = SettingPage::new("General")
