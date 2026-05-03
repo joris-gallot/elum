@@ -6,6 +6,7 @@ pub enum UiIconName {
   X,
   Plus,
   Server,
+  Settings,
   ShieldCheck,
   TriangleAlert,
 }
@@ -16,6 +17,7 @@ impl IconNamed for UiIconName {
       Self::X => "icons/x.svg".into(),
       Self::Plus => "icons/plus.svg".into(),
       Self::Server => "icons/server.svg".into(),
+      Self::Settings => "icons/settings.svg".into(),
       Self::ShieldCheck => "icons/shield-check.svg".into(),
       Self::TriangleAlert => "icons/triangle-alert.svg".into(),
     }

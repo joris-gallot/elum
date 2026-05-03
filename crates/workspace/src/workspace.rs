@@ -42,8 +42,40 @@ actions!(
     PrevTab,
     /// Quit the application.
     Quit,
+    /// Open the settings page.
+    OpenSettings,
+    /// Close whatever full-screen page is currently up
+    ClosePage,
   ]
 );
+
+/// Key context applied to whichever full-screen page is currently shown.
+pub const PAGE_KEY_CONTEXT: &str = "Page";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceView {
+  Tabs,
+  Page(Page),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+  Settings,
+}
+
+impl Page {
+  fn title(self) -> &'static str {
+    match self {
+      Page::Settings => "Settings",
+    }
+  }
+
+  fn render_content(self, cx: &mut Context<Workspace>) -> AnyElement {
+    match self {
+      Page::Settings => crate::settings_view::settings(cx).into_any_element(),
+    }
+  }
+}
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = elum, no_json)]
@@ -53,9 +85,7 @@ pub struct EditHost(pub SharedString);
 #[action(namespace = elum, no_json)]
 pub struct DeleteHost(pub SharedString);
 
-/// Key context for app-level bindings. Bindings registered under this
-/// context fire from anywhere within the app (including focused terminals).
-/// Keystroke->action wiring lives in [`crate::keymap`].
+/// Key context for app-level bindings
 pub const KEY_CONTEXT: &str = "Workspace";
 
 const SIDEBAR_DEFAULT_WIDTH: f32 = 200.0;
@@ -70,16 +100,16 @@ pub struct Workspace {
   host_book: HostBook,
   tabs: Vec<Tab>,
   active_tab: Option<usize>,
+  view: WorkspaceView,
   runtime: Arc<Runtime>,
   next_tab_id: u64,
   focus: FocusHandle,
+  /// Dedicated focus handle for the active full-screen page
+  page_focus: FocusHandle,
   /// Producer side of the host-key-prompt pipeline. Each `ConnectConfig`
-  /// gets a `WorkspaceHostKeyPolicy` cloned from this sender; the policy
-  /// posts a request and waits for the dialog's verdict.
+  /// gets a `WorkspaceHostKeyPolicy` cloned from this sender
   host_key_requests: flume::Sender<HostKeyRequest>,
-  /// Long-running task that drains `host_key_requests`, opens the dialog
-  /// for each, and forwards the verdict back through the request's
-  /// reply channel. Held here so it stays alive as long as the workspace.
+  /// Long-running task that drains `host_key_requests`
   _host_key_loop: Task<()>,
 }
 
@@ -140,9 +170,8 @@ impl Workspace {
     cx: &mut Context<Self>,
   ) -> Self {
     let focus = cx.focus_handle();
-    // Focus the app on init so keybindings dispatch immediately, before
-    // the user has clicked anything. When a tab becomes active we hand
-    // focus down to its TerminalView.
+    let page_focus = cx.focus_handle();
+
     window.focus(&focus, cx);
 
     let (host_key_requests, host_key_rx) = flume::unbounded::<HostKeyRequest>();
@@ -178,9 +207,11 @@ impl Workspace {
       host_book,
       tabs: Vec::new(),
       active_tab: None,
+      view: WorkspaceView::Tabs,
       runtime,
       next_tab_id: 1,
       focus,
+      page_focus,
       host_key_requests,
       _host_key_loop: host_key_loop,
     }
@@ -217,6 +248,7 @@ impl Workspace {
       _shell_closed: None,
     });
     self.active_tab = Some(self.tabs.len() - 1);
+    self.view = WorkspaceView::Tabs;
     cx.notify();
 
     match &host.auth {
@@ -498,8 +530,13 @@ impl Workspace {
   }
 
   fn activate_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-    if idx < self.tabs.len() && self.active_tab != Some(idx) {
+    if idx >= self.tabs.len() {
+      return;
+    }
+    let was_on_page = !matches!(self.view, WorkspaceView::Tabs);
+    if was_on_page || self.active_tab != Some(idx) {
       self.active_tab = Some(idx);
+      self.view = WorkspaceView::Tabs;
 
       if let Some(tab) = self.tabs.get_mut(idx) {
         tab.has_bell = false;
@@ -549,6 +586,40 @@ impl Workspace {
 
   fn on_quit(&mut self, _: &Quit, _w: &mut Window, cx: &mut Context<Self>) {
     cx.quit();
+  }
+
+  fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+    self.open_page(Page::Settings, window, cx);
+  }
+
+  fn on_close_page(&mut self, _: &ClosePage, window: &mut Window, cx: &mut Context<Self>) {
+    self.close_page(window, cx);
+  }
+
+  fn open_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+    if matches!(self.view, WorkspaceView::Page(p) if p == page) {
+      return;
+    }
+    self.view = WorkspaceView::Page(page);
+    // Focus the page-scoped handle so the `Page` key context lands in
+    // the focus chain, even before the user clicks any inner widget —
+    // otherwise `Escape` → `ClosePage` only fires once a child input
+    // (e.g. the settings search box) is focused.
+    window.focus(&self.page_focus, cx);
+    cx.notify();
+  }
+
+  fn close_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if matches!(self.view, WorkspaceView::Tabs) {
+      return;
+    }
+    self.view = WorkspaceView::Tabs;
+    self.focus_active(window, cx);
+    cx.notify();
+  }
+
+  fn is_page_active(&self, page: Page) -> bool {
+    matches!(self.view, WorkspaceView::Page(p) if p == page)
   }
 
   pub(crate) fn add_host_from_dialog(&mut self, input: NewHostInput, cx: &mut Context<Self>) {
@@ -731,11 +802,23 @@ impl Workspace {
       }))
     };
 
+    let settings_menu = SidebarMenu::new().child(
+      SidebarMenuItem::new("Settings")
+        .icon(UiIconName::Settings)
+        .active(self.is_page_active(Page::Settings))
+        .on_click(move |_, window, cx| {
+          let _ = view.update(cx, |this, cx| {
+            this.open_page(Page::Settings, window, cx);
+          });
+        }),
+    );
+
     Sidebar::new("hosts")
       .w(relative(1.))
       .border_0()
       .header(header)
       .child(menu)
+      .child(settings_menu)
       .bg(theme.sidebar)
       .into_any_element()
   }
@@ -786,6 +869,58 @@ impl Workspace {
     }
 
     bar.into_any_element()
+  }
+
+  /// Wrap any [`Page`] in the shared full-screen chrome: title on the
+  /// left, close `X` on the right, then the page's own content. The
+  /// wrapper sets [`PAGE_KEY_CONTEXT`] so the keymap can route `Escape`
+  /// to [`ClosePage`].
+  fn render_page(&self, page: Page, cx: &mut Context<Self>) -> AnyElement {
+    let theme = cx.theme();
+    let entity = cx.entity().downgrade();
+    let close_button = Button::new("close-page")
+      .icon(UiIconName::X)
+      .ghost()
+      .small()
+      .on_click(move |_, window, cx| {
+        let _ = entity.update(cx, |this, cx| {
+          this.close_page(window, cx);
+        });
+      });
+
+    let header = div()
+      .h_flex()
+      .items_center()
+      .justify_between()
+      .px_3()
+      .py_2()
+      .border_b_1()
+      .border_color(theme.border)
+      .child(
+        div()
+          .text_sm()
+          .text_color(theme.foreground)
+          .child(SharedString::from(page.title())),
+      )
+      .child(close_button);
+
+    div()
+      .key_context(PAGE_KEY_CONTEXT)
+      .track_focus(&self.page_focus)
+      .on_action(cx.listener(Self::on_close_page))
+      .flex()
+      .flex_col()
+      .flex_1()
+      .size_full()
+      .child(header)
+      .child(
+        div()
+          .flex()
+          .flex_1()
+          .size_full()
+          .child(page.render_content(cx)),
+      )
+      .into_any_element()
   }
 
   fn render_active_body(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -851,18 +986,33 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
   fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-    let bg = cx.theme().accent;
+    let bg = cx.theme().background;
     let fg = cx.theme().foreground;
     let titlebar_bg = cx.theme().sidebar;
 
-    let main = div()
-      .flex()
-      .flex_col()
-      .flex_1()
-      .h_full()
-      .child(self.render_tab_bar(cx))
-      .child(self.render_active_body(cx))
-      .into_any_element();
+    let body: AnyElement = match self.view {
+      WorkspaceView::Page(page) => self.render_page(page, cx),
+      WorkspaceView::Tabs => {
+        let main = div()
+          .flex()
+          .flex_col()
+          .flex_1()
+          .h_full()
+          .child(self.render_tab_bar(cx))
+          .child(self.render_active_body(cx))
+          .into_any_element();
+
+        h_resizable("workspace-split")
+          .child(
+            resizable_panel()
+              .size(px(SIDEBAR_DEFAULT_WIDTH))
+              .size_range(px(SIDEBAR_MIN_WIDTH)..px(SIDEBAR_MAX_WIDTH))
+              .child(self.render_sidebar(cx)),
+          )
+          .child(main)
+          .into_any_element()
+      }
+    };
 
     div()
       .key_context(KEY_CONTEXT)
@@ -871,6 +1021,8 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::on_next_tab))
       .on_action(cx.listener(Self::on_prev_tab))
       .on_action(cx.listener(Self::on_quit))
+      .on_action(cx.listener(Self::on_open_settings))
+      .on_action(cx.listener(Self::on_close_page))
       .on_action(cx.listener(Self::on_edit_host))
       .on_action(cx.listener(Self::on_delete_host))
       .flex()
@@ -879,16 +1031,7 @@ impl Render for Workspace {
       .bg(bg)
       .text_color(fg)
       .child(TitleBar::new().bg(titlebar_bg))
-      .child(
-        h_resizable("workspace-split")
-          .child(
-            resizable_panel()
-              .size(px(SIDEBAR_DEFAULT_WIDTH))
-              .size_range(px(SIDEBAR_MIN_WIDTH)..px(SIDEBAR_MAX_WIDTH))
-              .child(self.render_sidebar(cx)),
-          )
-          .child(main),
-      )
+      .child(body)
   }
 }
 

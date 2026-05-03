@@ -7,8 +7,8 @@ use app_root::AppRoot;
 #[cfg(target_os = "macos")]
 use gpui::{point, TitlebarOptions};
 use gpui::{px, size, App, AppContext, Bounds, Menu, MenuItem, WindowBounds, WindowOptions};
-use workspace::workspace::Quit;
-use workspace::{Host, HostAuth, HostBook, Workspace};
+use workspace::workspace::{OpenSettings, Quit};
+use workspace::{apply_theme, AppSettings, Host, HostAuth, HostBook, Workspace};
 
 const INITIAL_WIDTH_PX: f32 = 900.0;
 const INITIAL_HEIGHT_PX: f32 = 540.0;
@@ -43,11 +43,17 @@ fn main() {
     }
   }
 
+  let settings = AppSettings::load_from(AppSettings::default_path()).unwrap_or_else(|e| {
+    eprintln!("warning: failed to load app settings: {e:#}, using defaults");
+    AppSettings::default()
+  });
+
   gpui_platform::application()
     .with_assets(ui::AppAssets)
     .run(move |cx: &mut App| {
       gpui_component::init(cx);
-      gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+      apply_theme(&settings, cx);
+      cx.set_global(settings);
 
       workspace::install_default_keybindings(cx);
       cx.set_menus(build_app_menus());
@@ -91,7 +97,11 @@ fn build_app_menus() -> Vec<Menu> {
   vec![Menu {
     name: "Elum".into(),
     disabled: false,
-    items: vec![MenuItem::action("Quit Elum", Quit)],
+    items: vec![
+      MenuItem::action("Settings…", OpenSettings),
+      MenuItem::separator(),
+      MenuItem::action("Quit Elum", Quit),
+    ],
   }]
 }
 
