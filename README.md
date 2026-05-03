@@ -22,7 +22,3 @@ cargo run
 - `terminal` - terminal view and rendering
 - `ssh` - SSH transport
 - `ui` - shared UI bits (dialogs, icons)
-
-## License
-
-AGPL-3.0-only
