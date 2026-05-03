@@ -9,6 +9,7 @@ pub enum UiIconName {
   Settings,
   ShieldCheck,
   TriangleAlert,
+  Import,
 }
 
 impl IconNamed for UiIconName {
@@ -20,6 +21,7 @@ impl IconNamed for UiIconName {
       Self::Settings => "icons/settings.svg".into(),
       Self::ShieldCheck => "icons/shield-check.svg".into(),
       Self::TriangleAlert => "icons/triangle-alert.svg".into(),
+      Self::Import => "icons/import.svg".into(),
     }
   }
 }

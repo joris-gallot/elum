@@ -23,6 +23,7 @@ anyhow = "1"
 async-trait = "0.1"
 flume = "0.11"
 keyring = { version = "3", features = ["apple-native"] }
+ssh2-config = "0.7"
 
 [dev-dependencies]
 tempfile = "3"

@@ -3,6 +3,7 @@ pub mod host_book;
 pub mod keychain;
 pub mod keymap;
 mod settings_view;
+pub mod ssh_config_import;
 pub mod workspace;
 
 pub use app_settings::{AppSettings, ThemeMode};

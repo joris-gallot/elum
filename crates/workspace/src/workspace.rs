@@ -7,12 +7,12 @@ use gpui::{
   Focusable, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled,
   Subscription, Task, Window,
 };
-use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
+use gpui_component::button::{Button, ButtonVariant, ButtonVariants, DropdownButton};
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
 use gpui_component::tab::{Tab as ComponentTab, TabBar};
-use gpui_component::{ActiveTheme, Sizable, StyledExt, TitleBar, WindowExt as _};
+use gpui_component::{ActiveTheme, Icon, Sizable, StyledExt, TitleBar, WindowExt as _};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -26,8 +26,10 @@ use tokio::runtime::Runtime;
 
 use crate::host_book::{Host, HostAuth, HostBook};
 use crate::keychain;
+use crate::ssh_config_import;
 use ui::add_host_dialog::{self, NewAuth, NewHostInput};
 use ui::host_key_dialog::{self, HostKeyDialogInfo, HostKeyDialogKind, HostKeyDialogVerdict};
+use ui::import_ssh_config_dialog::{self, ImportRow};
 use ui::secret_prompt::{self, SecretPrompt};
 use ui::UiIconName;
 
@@ -85,11 +87,15 @@ pub struct EditHost(pub SharedString);
 #[action(namespace = elum, no_json)]
 pub struct DeleteHost(pub SharedString);
 
+#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
+#[action(namespace = elum, no_json)]
+pub struct ImportSshConfig;
+
 /// Key context for app-level bindings
 pub const KEY_CONTEXT: &str = "Workspace";
 
-const SIDEBAR_DEFAULT_WIDTH: f32 = 200.0;
-const SIDEBAR_MIN_WIDTH: f32 = 160.0;
+const SIDEBAR_DEFAULT_WIDTH: f32 = 230.0;
+const SIDEBAR_MIN_WIDTH: f32 = 200.0;
 const SIDEBAR_MAX_WIDTH: f32 = 400.0;
 const TAB_BAR_HEIGHT_PX: f32 = 30.0;
 
@@ -727,15 +733,77 @@ impl Workspace {
     });
   }
 
+  fn on_import_ssh_config(
+    &mut self,
+    _: &ImportSshConfig,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    self.open_import_ssh_config(window, cx);
+  }
+
+  fn open_import_ssh_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let candidates = match ssh_config_import::default_ssh_config_path() {
+      Some(path) if path.exists() => {
+        match ssh_config_import::parse_ssh_config(&path, &self.host_book) {
+          Ok(c) => c,
+          Err(e) => {
+            eprintln!("warning: failed to read ~/.ssh/config: {e:#}");
+            Vec::new()
+          }
+        }
+      }
+      _ => Vec::new(),
+    };
+
+    let rows: Vec<ImportRow> = candidates
+      .iter()
+      .map(|c| ImportRow {
+        alias: c.alias.clone(),
+        host: c.host.clone(),
+        port: c.port,
+        user: c.user.clone(),
+        already_exists: c.already_exists,
+        warnings: c.warnings.clone(),
+      })
+      .collect();
+
+    let view = cx.entity().downgrade();
+    import_ssh_config_dialog::open(window, cx, rows, move |picks, cx| {
+      let _ = view.update(cx, |this, cx| {
+        let chosen: Vec<_> = picks
+          .into_iter()
+          .filter_map(|i| candidates.get(i).cloned())
+          .collect();
+        this.import_hosts_from_candidates(chosen, cx);
+      });
+    });
+  }
+
+  pub(crate) fn import_hosts_from_candidates(
+    &mut self,
+    candidates: Vec<ssh_config_import::ImportCandidate>,
+    cx: &mut Context<Self>,
+  ) {
+    if candidates.is_empty() {
+      return;
+    }
+    for c in &candidates {
+      let id = generate_host_id();
+      let host = ssh_config_import::candidate_to_host(id, c);
+      self.host_book.add(host);
+    }
+    self.persist_host_book();
+    cx.notify();
+  }
+
   fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
     let view = cx.entity().downgrade();
     let theme = cx.theme();
 
-    let add_button = Button::new("add-host")
+    let add_trigger = Button::new("add-host")
       .icon(UiIconName::Plus)
-      .ghost()
-      .small()
-      .tooltip("Add host")
+      .label("Add host")
       .on_click({
         let view = view.clone();
         move |_, window, cx| {
@@ -746,6 +814,17 @@ impl Workspace {
             });
           });
         }
+      });
+
+    let add_button = DropdownButton::new("add-host-dropdown")
+      .xsmall()
+      .button(add_trigger)
+      .dropdown_menu(|menu, _, _| {
+        menu.menu_with_icon(
+          "Import from ~/.ssh/config",
+          Icon::new(UiIconName::Import),
+          Box::new(ImportSshConfig),
+        )
       });
 
     let header = div()
@@ -992,6 +1071,7 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::on_close_page))
       .on_action(cx.listener(Self::on_edit_host))
       .on_action(cx.listener(Self::on_delete_host))
+      .on_action(cx.listener(Self::on_import_ssh_config))
       .flex()
       .flex_col()
       .size_full()
