@@ -183,6 +183,7 @@ where
 
     dialog
       .w(px(440.))
+      .overlay_closable(false)
       .title(title)
       .child(form)
       .footer(
