@@ -8,7 +8,8 @@
 //!   "version": 1,
 //!   "theme_mode": "dark",
 //!   "auto_switch_theme": false,
-//!   "terminal_theme": "one_dark"
+//!   "terminal_dark_theme": "one_dark",
+//!   "terminal_light_theme": "github_light"
 //! }
 //! ```
 
@@ -35,8 +36,18 @@ struct AppSettingsFile {
   theme_mode: ThemeMode,
   #[serde(default)]
   auto_switch_theme: bool,
-  #[serde(default)]
-  terminal_theme: TerminalThemeId,
+  #[serde(default = "default_terminal_dark_theme")]
+  terminal_dark_theme: TerminalThemeId,
+  #[serde(default = "default_terminal_light_theme")]
+  terminal_light_theme: TerminalThemeId,
+}
+
+fn default_terminal_dark_theme() -> TerminalThemeId {
+  TerminalThemeId::OneDark
+}
+
+fn default_terminal_light_theme() -> TerminalThemeId {
+  TerminalThemeId::GitHubLight
 }
 
 const SCHEMA_VERSION: u32 = 1;
@@ -45,8 +56,12 @@ const SCHEMA_VERSION: u32 = 1;
 pub struct AppSettings {
   path: PathBuf,
   pub theme_mode: ThemeMode,
+  /// When true, the active theme follows the OS; `theme_mode` is the manual fallback.
   pub auto_switch_theme: bool,
-  pub terminal_theme: TerminalThemeId,
+  /// Terminal palette used while the app is in dark mode.
+  pub terminal_dark_theme: TerminalThemeId,
+  /// Terminal palette used while the app is in light mode.
+  pub terminal_light_theme: TerminalThemeId,
 }
 
 impl gpui::Global for AppSettings {}
@@ -57,7 +72,8 @@ impl Default for AppSettings {
       path: Self::default_path(),
       theme_mode: ThemeMode::default(),
       auto_switch_theme: false,
-      terminal_theme: TerminalThemeId::default(),
+      terminal_dark_theme: default_terminal_dark_theme(),
+      terminal_light_theme: default_terminal_light_theme(),
     }
   }
 }
@@ -87,14 +103,16 @@ impl AppSettings {
           path,
           theme_mode: file.theme_mode,
           auto_switch_theme: file.auto_switch_theme,
-          terminal_theme: file.terminal_theme,
+          terminal_dark_theme: file.terminal_dark_theme,
+          terminal_light_theme: file.terminal_light_theme,
         })
       }
       Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self {
         path,
         theme_mode: ThemeMode::default(),
         auto_switch_theme: false,
-        terminal_theme: TerminalThemeId::default(),
+        terminal_dark_theme: default_terminal_dark_theme(),
+        terminal_light_theme: default_terminal_light_theme(),
       }),
       Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
@@ -110,7 +128,8 @@ impl AppSettings {
       version: SCHEMA_VERSION,
       theme_mode: self.theme_mode,
       auto_switch_theme: self.auto_switch_theme,
-      terminal_theme: self.terminal_theme,
+      terminal_dark_theme: self.terminal_dark_theme,
+      terminal_light_theme: self.terminal_light_theme,
     };
     let text = serde_json::to_string_pretty(&file).context("serializing app settings")?;
 
@@ -134,7 +153,8 @@ mod tests {
     let settings = AppSettings::load_from(&path).expect("load");
     assert_eq!(settings.theme_mode, ThemeMode::Dark);
     assert!(!settings.auto_switch_theme);
-    assert_eq!(settings.terminal_theme, TerminalThemeId::default());
+    assert_eq!(settings.terminal_dark_theme, TerminalThemeId::OneDark);
+    assert_eq!(settings.terminal_light_theme, TerminalThemeId::GitHubLight);
   }
 
   #[test]
@@ -144,13 +164,18 @@ mod tests {
     let mut settings = AppSettings::load_from(&path).unwrap();
     settings.theme_mode = ThemeMode::Light;
     settings.auto_switch_theme = true;
-    settings.terminal_theme = TerminalThemeId::Dracula;
+    settings.terminal_dark_theme = TerminalThemeId::Dracula;
+    settings.terminal_light_theme = TerminalThemeId::SolarizedLight;
     settings.save().unwrap();
 
     let reloaded = AppSettings::load_from(&path).unwrap();
     assert_eq!(reloaded.theme_mode, ThemeMode::Light);
     assert!(reloaded.auto_switch_theme);
-    assert_eq!(reloaded.terminal_theme, TerminalThemeId::Dracula);
+    assert_eq!(reloaded.terminal_dark_theme, TerminalThemeId::Dracula);
+    assert_eq!(
+      reloaded.terminal_light_theme,
+      TerminalThemeId::SolarizedLight
+    );
   }
 
   #[test]
@@ -161,7 +186,8 @@ mod tests {
     let settings = AppSettings::load_from(&path).expect("load");
     assert_eq!(settings.theme_mode, ThemeMode::Light);
     assert!(!settings.auto_switch_theme);
-    assert_eq!(settings.terminal_theme, TerminalThemeId::default());
+    assert_eq!(settings.terminal_dark_theme, TerminalThemeId::OneDark);
+    assert_eq!(settings.terminal_light_theme, TerminalThemeId::GitHubLight);
   }
 
   #[test]

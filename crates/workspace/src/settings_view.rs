@@ -5,6 +5,8 @@ use terminal::colors::{TerminalTheme, TerminalThemeId};
 use crate::app_settings::{AppSettings, ThemeMode};
 
 /// Push settings into the live `gpui_component::Theme` and `TerminalTheme` globals.
+/// The terminal palette tracks the active app mode: dark mode uses
+/// `terminal_dark_theme`, light mode uses `terminal_light_theme`.
 pub fn apply_theme(settings: &AppSettings, cx: &mut App) {
   if settings.auto_switch_theme {
     gpui_component::Theme::sync_system_appearance(None, cx);
@@ -15,7 +17,13 @@ pub fn apply_theme(settings: &AppSettings, cx: &mut App) {
     };
     gpui_component::Theme::change(mode, None, cx);
   }
-  cx.set_global::<TerminalTheme>(settings.terminal_theme.theme());
+  let is_dark = gpui_component::Theme::global(cx).mode.is_dark();
+  let chosen = if is_dark {
+    settings.terminal_dark_theme
+  } else {
+    settings.terminal_light_theme
+  };
+  cx.set_global::<TerminalTheme>(chosen.theme());
 }
 
 fn update_settings_and_apply(cx: &mut App, mutate: impl FnOnce(&mut AppSettings)) {
@@ -29,6 +37,28 @@ fn update_settings_and_apply(cx: &mut App, mutate: impl FnOnce(&mut AppSettings)
   if let Err(e) = settings_to_save.save() {
     eprintln!("warning: failed to save app settings: {e:#}");
   }
+}
+
+/// Build a terminal-theme dropdown that reads/writes one slot of `AppSettings`.
+fn terminal_theme_dropdown(
+  read: fn(&AppSettings) -> TerminalThemeId,
+  write: fn(&mut AppSettings, TerminalThemeId),
+) -> SettingField<SharedString> {
+  let options: Vec<(SharedString, SharedString)> = TerminalThemeId::all()
+    .iter()
+    .map(|id| (id.slug().into(), id.label().into()))
+    .collect();
+  SettingField::dropdown(
+    options,
+    move |cx: &App| -> SharedString { read(cx.global::<AppSettings>()).slug().into() },
+    move |val: SharedString, cx: &mut App| {
+      let new_id = TerminalThemeId::from_slug(val.as_ref());
+      if read(cx.global::<AppSettings>()) == new_id {
+        return;
+      }
+      update_settings_and_apply(cx, |settings| write(settings, new_id));
+    },
+  )
 }
 
 pub(crate) fn settings(_cx: &mut App) -> Settings {
@@ -58,20 +88,13 @@ pub(crate) fn settings(_cx: &mut App) -> Settings {
     },
   );
 
-  let terminal_theme_options: Vec<(SharedString, SharedString)> = TerminalThemeId::all()
-    .iter()
-    .map(|id| (id.slug().into(), id.label().into()))
-    .collect();
-  let terminal_theme_field = SettingField::dropdown(
-    terminal_theme_options,
-    |cx: &App| -> SharedString { cx.global::<AppSettings>().terminal_theme.slug().into() },
-    |val: SharedString, cx: &mut App| {
-      let new_id = TerminalThemeId::from_slug(val.as_ref());
-      if cx.global::<AppSettings>().terminal_theme == new_id {
-        return;
-      }
-      update_settings_and_apply(cx, |settings| settings.terminal_theme = new_id);
-    },
+  let dark_terminal_field = terminal_theme_dropdown(
+    |s| s.terminal_dark_theme,
+    |s, id| s.terminal_dark_theme = id,
+  );
+  let light_terminal_field = terminal_theme_dropdown(
+    |s| s.terminal_light_theme,
+    |s, id| s.terminal_light_theme = id,
   );
 
   let appearance = SettingGroup::new()
@@ -86,8 +109,12 @@ pub(crate) fn settings(_cx: &mut App) -> Settings {
         .description("Follow the system appearance instead of the manual choice above."),
     )
     .item(
-      SettingItem::new("Terminal theme", terminal_theme_field)
-        .description("Color palette used by the terminal grid (foreground, background, ANSI 16)."),
+      SettingItem::new("Terminal theme (dark)", dark_terminal_field)
+        .description("Palette used by the terminal grid while the app is in dark mode."),
+    )
+    .item(
+      SettingItem::new("Terminal theme (light)", light_terminal_field)
+        .description("Palette used by the terminal grid while the app is in light mode."),
     );
 
   let general = SettingPage::new("General")
