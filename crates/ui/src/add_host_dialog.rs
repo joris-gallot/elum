@@ -5,7 +5,7 @@ use std::rc::Rc;
 use gpui::{px, App, AppContext, Entity, ParentElement, Styled, Window};
 use gpui_component::{
   button::{Button, ButtonVariants as _},
-  dialog::{DialogAction, DialogClose, DialogFooter},
+  dialog::{CancelDialog, ConfirmDialog, DialogFooter},
   form::{field, v_form},
   input::{Input, InputState},
   tab::{Tab, TabBar},
@@ -188,8 +188,24 @@ where
       .footer(
         DialogFooter::new()
           .gap_2()
-          .child(DialogClose::new().child(Button::new("cancel").outline().label("Cancel")))
-          .child(DialogAction::new().child(Button::new("save").primary().label(confirm_label))),
+          .child(
+            Button::new("cancel")
+              .outline()
+              .flex_1()
+              .label("Cancel")
+              .on_click(|_, window, cx| {
+                window.dispatch_action(Box::new(CancelDialog), cx);
+              }),
+          )
+          .child(
+            Button::new("save")
+              .primary()
+              .flex_1()
+              .label(confirm_label)
+              .on_click(|_, window, cx| {
+                window.dispatch_action(Box::new(ConfirmDialog), cx);
+              }),
+          ),
       )
       .on_ok(move |_, _window, cx| {
         let name_v = read_value(&name, cx);
