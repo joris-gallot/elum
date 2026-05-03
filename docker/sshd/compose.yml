@@ -1,7 +1,7 @@
 # Local SSH server for Elum integration tests.
 # Bring up:   docker compose -f docker/sshd/compose.yml up -d
 # Bring down: docker compose -f docker/sshd/compose.yml down
-
+name: elum-sshd-dev
 services:
   sshd:
     build: .
