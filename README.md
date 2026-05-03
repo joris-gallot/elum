@@ -21,8 +21,14 @@ cargo run
 - `workspace` - main window, sidebar, tabs, settings
 - `terminal` - terminal view and rendering
 - `ssh` - SSH transport
-- `ui` - shared UI bits (dialogs, icons)
+- `ui` - shared UI
 
 ## Tests
 
-A local `sshd` container is used for integration tests. See [docker/sshd/fixtures/README.md](docker/sshd/fixtures/README.md) for details on the bundled test key.
+Integration tests target a local `sshd` container, start it before running the suite:
+
+```sh
+docker compose -f docker/sshd/compose.yml up -d --build --wait
+cargo test --workspace
+docker compose -f docker/sshd/compose.yml down -v
+```
