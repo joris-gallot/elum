@@ -604,10 +604,6 @@ impl Workspace {
     cx.notify();
   }
 
-  fn is_page_active(&self, page: Page) -> bool {
-    matches!(self.view, WorkspaceView::Page(p) if p == page)
-  }
-
   pub(crate) fn add_host_from_dialog(&mut self, input: NewHostInput, cx: &mut Context<Self>) {
     let id = generate_host_id();
     let auth = build_host_auth(&id, input.auth, &HostAuth::Password { in_keychain: false });
@@ -788,23 +784,11 @@ impl Workspace {
       }))
     };
 
-    let settings_menu = SidebarMenu::new().child(
-      SidebarMenuItem::new("Settings")
-        .icon(UiIconName::Settings)
-        .active(self.is_page_active(Page::Settings))
-        .on_click(move |_, window, cx| {
-          let _ = view.update(cx, |this, cx| {
-            this.open_page(Page::Settings, window, cx);
-          });
-        }),
-    );
-
     Sidebar::new("hosts")
       .w(relative(1.))
       .border_0()
       .header(header)
       .child(menu)
-      .child(settings_menu)
       .bg(theme.sidebar)
       .into_any_element()
   }
