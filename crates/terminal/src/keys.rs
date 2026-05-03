@@ -1,7 +1,4 @@
-//! Keystroke → byte encoding for the terminal input path.
-//!
-//! The function is pure: same `(keystroke, mode)` always yields the same
-//! bytes. That makes it trivially testable without a window or app.
+//! Keystroke -> byte encoding for the terminal input path.
 
 use alacritty_terminal::term::TermMode;
 use gpui::Keystroke;
@@ -16,9 +13,7 @@ enum Mods {
   CtrlShift,
   CtrlAlt,
   ShiftCtrlAlt,
-  /// Anything involving the platform-meta key (Cmd on macOS, Win on
-  /// Linux/Windows). Those are reserved for app-level shortcuts; we
-  /// don't forward them to the PTY.
+  /// Cmd / Win - reserved for app-level shortcuts, never forwarded to the PTY.
   Other,
 }
 
@@ -42,9 +37,7 @@ impl Mods {
     }
   }
 
-  /// xterm modifier code in the range 1..=8 used inside CSI sequences
-  /// like `\x1b[1;<code>A`. `1` means no modifier (and is omitted in the
-  /// emitted sequence).
+  /// xterm modifier code (1..=8) for CSI sequences. `1` is omitted from the wire.
   fn xterm_code(self) -> Option<u8> {
     Some(match self {
       Mods::None => 1,
@@ -93,10 +86,7 @@ fn special_key(key: &str, mods: &Mods, mode: TermMode) -> Option<Vec<u8>> {
   let app_cursor = mode.contains(TermMode::APP_CURSOR);
   let mod_code = mods.xterm_code()?;
 
-  // Cursor keys: arrows + home/end. Use SS3 when the remote requested
-  // application cursor mode AND no modifiers are held; otherwise fall
-  // back to CSI with an explicit modifier code (1 means "none" and is
-  // emitted bare).
+  // SS3 only in app-cursor mode and unmodified; otherwise CSI with explicit modifier.
   if let Some(letter) = cursor_letter(key) {
     if mod_code == 1 {
       return Some(if app_cursor {
@@ -128,9 +118,7 @@ fn special_key(key: &str, mods: &Mods, mode: TermMode) -> Option<Vec<u8>> {
   None
 }
 
-/// Plain control keys whose encoding does not follow the CSI/SS3 family
-/// (so the modifier-code machinery doesn't apply). Each variant lists
-/// only the modifier combos that have a meaningful encoding.
+/// Plain control keys outside the CSI/SS3 family.
 fn simple_key(key: &str, mods: &Mods) -> Option<Vec<u8>> {
   let s: &[u8] = match (key, mods) {
     ("tab", Mods::None) => b"\x09",
@@ -345,10 +333,7 @@ mod tests {
 
   #[test]
   fn plain_letter_returns_none_so_ime_handles_it() {
-    // Plain printable text is delivered via the platform IME pipeline
-    // (`InputHandler::replace_text_in_range`), not via `KeyDownEvent`,
-    // so this function deliberately drops it on the floor to avoid
-    // double input.
+    // Printable text comes via the IME pipeline; dropping it here avoids double input.
     assert_eq!(keystroke_to_bytes(&ks("a"), TermMode::empty()), None);
     let mut shifted = ks_with("a", shift());
     shifted.key_char = Some("A".into());

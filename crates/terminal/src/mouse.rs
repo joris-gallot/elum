@@ -1,23 +1,11 @@
 //! Terminal mouse-report encoding.
-//!
-//! The API is deliberately pure and GPUI-light: callers provide a cell point,
-//! a button/scroll event, modifiers, and the current alacritty `TermMode`.
-//! The returned bytes can be written straight to the SSH/PTTY channel.
 
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
 use alacritty_terminal::term::TermMode;
 use gpui::{Modifiers, MouseButton, Pixels, Point};
 
-/// Convert an element-local pixel point into an absolute alacritty grid
-/// point and the cell side (left/right) the cursor sits on.
-///
-/// `display_offset` is `term.grid().display_offset()`, how many lines
-/// the user has scrolled up into the scrollback. The returned `Line` is
-/// negative when the click landed in scrollback.
-///
-/// Inputs that fall outside the grid are clamped to the nearest edge,
-/// with `side` set to indicate the overshoot direction (so a drag past
-/// the right edge keeps including cells out to the last column).
+/// Element-local pixel -> absolute alacritty grid point + cell side. Out-of-grid
+/// points clamp to the nearest edge with `side` indicating the overshoot direction.
 pub fn pixel_to_point_and_side(
   pos: Point<Pixels>,
   cell_width: Pixels,

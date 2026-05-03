@@ -40,10 +40,7 @@ where
   F: Fn(HostKeyDialogVerdict, &mut Window, &mut App) + 'static,
 {
   let on_done = Rc::new(on_done);
-  // Each button below sets this before dispatching `CancelDialog` to
-  // close the dialog. The close-time callback below reads it back to
-  // know which verdict to forward; an unset value (escape, click
-  // outside, the explicit cancel button) means Reject.
+  // Buttons set this before dispatching `CancelDialog`; close-time None means Reject.
   let verdict = Rc::new(Cell::new(None::<HostKeyDialogVerdict>));
 
   window.open_dialog(cx, move |dialog, _, cx| {

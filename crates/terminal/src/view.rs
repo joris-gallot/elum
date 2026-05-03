@@ -154,20 +154,14 @@ impl TerminalView {
     );
   }
 
-  /// Borrow the focus handle. The element needs it to register the
-  /// platform [`gpui::InputHandler`] in its paint phase.
   pub(crate) fn focus(&self) -> &FocusHandle {
     &self.focus
   }
 
-  /// Currently composing text from the IME (pre-edit), if any. The
-  /// element paints this with an underline at the cursor.
   pub(crate) fn marked_text(&self) -> Option<&str> {
     self.marked_text.as_deref()
   }
 
-  /// IME callback: replace the pre-edit text. An empty string clears
-  /// the marked state. Notifies the view so the element repaints.
   pub(crate) fn set_marked_text(&mut self, text: String, cx: &mut Context<Self>) {
     if text.is_empty() {
       self.clear_marked_text(cx);
@@ -177,16 +171,12 @@ impl TerminalView {
     cx.notify();
   }
 
-  /// IME callback: drop any pre-edit state without committing.
   pub(crate) fn clear_marked_text(&mut self, cx: &mut Context<Self>) {
     if self.marked_text.take().is_some() {
       cx.notify();
     }
   }
 
-  /// IME callback: the user accepted a candidate, push the bytes
-  /// into the PTY and bring the viewport back to the live tail. Marked
-  /// state is dropped by the platform separately via `clear_marked_text`.
   pub(crate) fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
     if text.is_empty() {
       return;
@@ -198,14 +188,10 @@ impl TerminalView {
   }
 
   fn handle_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
-    // Anything we got here is a keystroke that didn't match a bound
-    // action - forward it to the remote shell. App shortcuts (Cmd-C,
-    // Cmd-V, Cmd-A) are dispatched via `on_action` below and never
-    // reach this path.
+    // Bound app shortcuts (Cmd-C/V/A) go through `on_action` and never reach here.
     let mode = self.terminal.with_term(|term| *term.mode());
     if let Some(bytes) = keystroke_to_bytes(&ev.keystroke, mode) {
-      // Typing means engaging with the live shell - snap back to
-      // bottom so input is visible, and clear any stale selection.
+      // Typing engages the live shell: snap to bottom and clear stale selection.
       self.terminal.scroll_to_bottom();
       self.terminal.clear_selection();
       let _ = self.to_remote.send(bytes);
@@ -245,9 +231,7 @@ impl TerminalView {
 
     let mode = self.terminal.with_term(|term| *term.mode());
     let bytes = if mode.contains(TermMode::BRACKETED_PASTE) {
-      // The remote app (vim, less, shells with sane configs) is
-      // signaling it wants pasted content delimited so it can skip
-      // auto-indent / interpretation. Wrap the payload accordingly.
+      // Wrap so the remote can skip auto-indent / interpretation.
       let mut out = Vec::with_capacity(text.len() + 12);
       out.extend_from_slice(b"\x1b[200~");
       out.extend_from_slice(text.as_bytes());
@@ -268,17 +252,8 @@ impl TerminalView {
     cx.notify();
   }
 
-  /// Pointer pressed inside the terminal area. `pos` is element-local.
-  ///
-  /// Selection variants are driven by alacritty's own `SelectionType`:
-  /// - `click_count == 1`, no shift: `Simple` selection anchored at the
-  ///   click. Drag extends focus.
-  /// - `click_count == 1`, shift held: extend the existing selection's
-  ///   focus to the click point. Otherwise behaves like a fresh click.
-  /// - `click_count == 2`: `Semantic` selection (word boundaries from
-  ///   alacritty's `Term::semantic_search_*`). Drag extends by whole
-  ///   words.
-  /// - `click_count >= 3`: `Lines` selection. Drag extends by whole lines.
+  /// Pointer pressed at element-local `pos`. Selection mode follows click_count
+  /// (1 = simple, 2 = semantic/word, 3+ = lines), shift extends an existing one.
   pub(crate) fn on_pointer_down(
     &mut self,
     pos: Point<Pixels>,
@@ -316,8 +291,6 @@ impl TerminalView {
 
     match click_count {
       0 | 1 if modifiers.shift && self.terminal.has_selection() => {
-        // Extend the existing selection's focus to the new point.
-        // Anchor/type are preserved.
         self.terminal.update_selection(point, side);
         self.dragging = false;
       }
@@ -406,9 +379,7 @@ impl TerminalView {
     }
 
     self.dragging = false;
-    // A bare click (no drag) collapses the selection to a zero-width
-    // range; alacritty's `is_empty()` reports it. Clear so we don't
-    // paint a phantom highlight on the click cell.
+    // Bare click without drag: clear so we don't paint a phantom 0-width selection.
     let still_empty = self
       .terminal
       .with_term(|t| t.selection.as_ref().is_some_and(|s| s.is_empty()));
@@ -418,11 +389,6 @@ impl TerminalView {
     }
   }
 
-  /// Convert an element-local point to an absolute alacritty grid point
-  /// plus the cell side (left/right) for half-cell precision. Uses the
-  /// cell metrics measured during the most recent paint and the live
-  /// scrollback offset so selections in scrollback stay anchored to
-  /// their content.
   fn pixel_to_point_and_side(
     &self,
     pos: Point<Pixels>,
@@ -524,18 +490,11 @@ impl TerminalView {
     self.scroll_px_acc
   }
 
-  /// Materialize the live selection as plain text. Delegates to
-  /// alacritty's `selection_to_string`, which already handles wide
-  /// chars, wrapped lines, and semantic/line-mode rules correctly.
   fn copy_selection_text(&self) -> Option<String> {
     self.terminal.selection_text()
   }
 
-  /// Called by [`crate::element::TerminalElement`] every prepaint with the
-  /// real bounds of the terminal area and the real per-cell metrics from
-  /// the cascaded font. Owns the resize policy: clamps to `MIN_COLS`/
-  /// `MIN_ROWS`, resizes alacritty's grid, and forwards the new size to
-  /// the SSH PTY when it actually changed.
+  /// Apply real bounds + cell metrics from prepaint; clamps to `MIN_COLS`/`MIN_ROWS`.
   pub(crate) fn sync_metrics(
     &mut self,
     cell_width: Pixels,
@@ -718,8 +677,6 @@ fn focus_report(focused: bool, mode: alacritty_terminal::term::TermMode) -> Opti
   })
 }
 
-/// Word-class predicate for double-click selection. Includes characters
-/// commonly found in identifiers, paths, and URLs so a double-click on
 impl Render for TerminalView {
   fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
     let focused = self.focus.is_focused(window);

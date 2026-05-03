@@ -104,12 +104,8 @@ pub struct Workspace {
   runtime: Arc<Runtime>,
   next_tab_id: u64,
   focus: FocusHandle,
-  /// Dedicated focus handle for the active full-screen page
   page_focus: FocusHandle,
-  /// Producer side of the host-key-prompt pipeline. Each `ConnectConfig`
-  /// gets a `WorkspaceHostKeyPolicy` cloned from this sender
   host_key_requests: flume::Sender<HostKeyRequest>,
-  /// Long-running task that drains `host_key_requests`
   _host_key_loop: Task<()>,
 }
 
@@ -144,15 +140,12 @@ impl HostKeyPolicy for WorkspaceHostKeyPolicy {
 }
 
 struct Tab {
-  /// Stable across reorderings; used by spawned tasks to find their tab
-  /// after the user may have closed/moved siblings.
+  /// Stable across reorderings; spawned tasks use it to find their tab.
   id: u64,
   host: Host,
   state: TabState,
   has_bell: bool,
   terminal_title: Option<String>,
-  /// Subscription to the [`TerminalView`]'s `ShellClosed` event. Held in
-  /// the tab so it stays alive for as long as the tab does
   _shell_closed: Option<Subscription>,
 }
 
@@ -217,8 +210,6 @@ impl Workspace {
     }
   }
 
-  /// Focus the active tab's `TerminalView`, if any. Falls back to the app
-  /// focus handle when there is no active tab or the tab isn't connected yet
   fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
     let view_focus = self
       .active_tab
@@ -322,9 +313,7 @@ impl Workspace {
     );
   }
 
-  /// Drop the tab identified by `tab_id`, regardless of its current
-  /// position in `self.tabs`. No-op if the tab no longer exists (e.g.,
-  /// the user closed it manually before this fired).
+  /// No-op if the tab no longer exists.
   fn close_tab_by_id(&mut self, tab_id: u64, window: &mut Window, cx: &mut Context<Self>) {
     if let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) {
       self.close_tab_at(idx, window, cx);
@@ -1029,19 +1018,14 @@ impl Render for Workspace {
   }
 }
 
-/// True when the connect failure was caused by a missing/wrong passphrase
-/// for an encrypted key. Matched on the error chain since russh wraps the
-/// `russh::keys::Error::KeyIsEncrypted` variant inside an anyhow context.
+/// Matched on the error chain since russh wraps `KeyIsEncrypted` inside anyhow context.
 fn is_encrypted_key_error(err: &anyhow::Error) -> bool {
   err
     .chain()
     .any(|cause| cause.to_string().contains("The key is encrypted"))
 }
 
-/// Build the persisted `HostAuth` from a dialog submission, writing any
-/// freshly-supplied secrets to the keychain. Falls back to the previous
-/// auth's `*_in_keychain` flag when the user kept the same auth mode and
-/// did not retype the secret.
+/// Persists fresh secrets to keychain; preserves the previous `*_in_keychain` flag otherwise.
 fn build_host_auth(host_id: &str, input: NewAuth, previous: &HostAuth) -> HostAuth {
   match input {
     NewAuth::PublicKey {
@@ -1077,8 +1061,7 @@ fn build_host_auth(host_id: &str, input: NewAuth, previous: &HostAuth) -> HostAu
   }
 }
 
-/// When the user switches auth modes on edit, drop the now-unused secret
-/// from the keychain. Same-mode edits leave the existing entry alone
+/// Drops the now-unused keychain entry when the user switches auth modes.
 fn purge_obsolete_keychain_entries(prev: &HostAuth, new: &NewAuth, host_id: &str) {
   match (prev, new) {
     (HostAuth::PublicKey { .. }, NewAuth::Password { .. }) => {
@@ -1091,8 +1074,6 @@ fn purge_obsolete_keychain_entries(prev: &HostAuth, new: &NewAuth, host_id: &str
   }
 }
 
-/// Generate a stable-enough host ID from the wall clock
-/// Collisions are effectively impossible for human-paced "Add Host" use
 fn generate_host_id() -> String {
   let ms = SystemTime::now()
     .duration_since(UNIX_EPOCH)

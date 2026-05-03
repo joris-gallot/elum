@@ -1,10 +1,4 @@
-//! Single source of truth for app keybindings.
-//!
-//! Actions stay defined in the crate that handles them,
-//! but the keystroke -> action mapping lives in one place.
-//!
-//! Call [`install`] once at app startup. The binary's `main.rs` is the
-//! sole caller; nothing else should need to invoke it.
+//! App keybindings. Actions stay in their owning crate; bindings live here.
 
 use gpui::{App, KeyBinding};
 

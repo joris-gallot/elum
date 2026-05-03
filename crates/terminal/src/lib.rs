@@ -1,6 +1,4 @@
-//! Terminal data model: wraps `alacritty_terminal::Term` and exposes
-//! source-agnostic write APIs. The model knows nothing about SSH,
-//! PTYs, or rendering, those concerns belong to other crates.
+//! Source-agnostic terminal data model wrapping `alacritty_terminal::Term`.
 
 pub mod colors;
 pub mod element;
@@ -25,10 +23,7 @@ use alacritty_terminal::{
 use flume::{unbounded, Receiver, Sender};
 use parking_lot::FairMutex;
 
-/// Logical terminal grid dimensions, expressed in cells (not pixels).
-///
-/// Implements `alacritty_terminal::grid::Dimensions` so it can be passed
-/// directly to `Term::new` / `Term::resize`.
+/// Grid dimensions in cells.
 #[derive(Debug, Clone, Copy)]
 pub struct GridSize {
   pub rows: u16,
@@ -36,14 +31,9 @@ pub struct GridSize {
   pub scrollback: u16,
 }
 
-/// Default scrollback line count. Tuned for "comfortable for casual SSH"
-/// without keeping huge log dumps in memory forever. Override per-call via
-/// the public field if needed.
 pub const DEFAULT_SCROLLBACK_LINES: u16 = 10_000;
 
 impl GridSize {
-  /// Build a `GridSize` with the default scrollback. Use field assignment
-  /// (`{ scrollback: 0, ..GridSize::new(rows, cols) }`) to override.
   pub fn new(rows: u16, cols: u16) -> Self {
     Self {
       rows,
@@ -67,9 +57,7 @@ impl Dimensions for GridSize {
   }
 }
 
-/// `EventListener` that forwards alacritty events through a `flume` channel.
-/// Consumers drain the receiver at their own cadence (or ignore it entirely
-/// in tests).
+/// Forwards alacritty events through a `flume` channel.
 pub struct ChannelListener(Sender<AlacEvent>);
 
 impl EventListener for ChannelListener {
@@ -78,9 +66,6 @@ impl EventListener for ChannelListener {
   }
 }
 
-/// Source-agnostic terminal model. Feed display text via [`Terminal::write`]
-/// or raw PTY bytes via [`Terminal::write_remote`]; inspect the grid via
-/// [`Terminal::with_term`].
 pub struct Terminal {
   term: Arc<FairMutex<Term<ChannelListener>>>,
   processor: FairMutex<Processor<StdSyncHandler>>,
@@ -102,8 +87,7 @@ impl Terminal {
     }
   }
 
-  /// Feed raw bytes from a real PTY/SSH shell into the terminal. This path
-  /// intentionally does not rewrite newlines or any other control bytes.
+  /// Feed raw PTY bytes verbatim - no newline rewriting, no escape filtering.
   pub fn write_remote(&self, bytes: &[u8]) {
     self.advance(bytes);
   }
@@ -114,51 +98,38 @@ impl Terminal {
     processor.advance(&mut *term, bytes);
   }
 
-  /// Borrow the underlying `Term` for inspection (rendering, tests).
   pub fn with_term<R>(&self, f: impl FnOnce(&Term<ChannelListener>) -> R) -> R {
     let term = self.term.lock();
     f(&term)
   }
 
-  /// Resize the grid. Pending: signal the SSH side so the remote can
-  /// re-flow output.
   pub fn resize(&self, size: GridSize) {
     let mut term = self.term.lock();
     term.resize(size);
   }
 
-  /// Shift the visible viewport by `delta` lines into / out of scrollback.
-  /// Positive shifts the view *up* into history; negative pushes it back
-  /// toward live output. No-op if no scrollback is available in the
-  /// requested direction.
+  /// Positive `delta` scrolls up into history; negative pushes back toward live.
   pub fn scroll_lines(&self, delta: i32) {
     let mut term = self.term.lock();
     term.scroll_display(Scroll::Delta(delta));
   }
 
-  /// Snap the viewport back to the bottom (the live cursor position).
-  /// Called when the user types something, since output should land in
-  /// view rather than be hidden under scrollback.
   pub fn scroll_to_bottom(&self) {
     let mut term = self.term.lock();
     term.scroll_display(Scroll::Bottom);
   }
 
-  /// Drain queued alacritty events (e.g. PTY writes the terminal wants to
-  /// emit in response to escape sequences). Returns ownership; consumers
-  /// forward bytes to the SSH channel.
+  /// Drain queued alacritty events. Consumers forward bytes back to the SSH channel.
   pub fn drain_events(&self) -> Vec<AlacEvent> {
     self.events.try_iter().collect()
   }
 
-  /// How many lines the user has scrolled into history. `0` means the
-  /// viewport is showing live output.
+  /// Lines scrolled into history; `0` = live output.
   pub fn display_offset(&self) -> usize {
     self.term.lock().grid().display_offset()
   }
 
-  /// Number of scrollback lines retained above the live screen. Caps the
-  /// maximum `display_offset` the user can reach by scrolling up.
+  /// Scrollback lines retained above the live screen.
   pub fn history_size(&self) -> usize {
     self.term.lock().grid().history_size()
   }
@@ -185,22 +156,15 @@ impl Terminal {
     term.selection = None;
   }
 
-  /// True if the user currently has any selection active.
   pub fn has_selection(&self) -> bool {
     self.term.lock().selection.is_some()
   }
 
-  /// Materialize the selected cells as a `String`, honoring wide chars,
-  /// trailing whitespace stripping, and CRLF semantics. Returns `None`
-  /// if the selection is empty or out of grid bounds.
   pub fn selection_text(&self) -> Option<String> {
     self.term.lock().selection_to_string()
   }
 
-  /// Replace the selection with one covering everything from the topmost
-  /// scrollback line to the bottommost live row. Matches the behavior of
-  /// iTerm2 / Terminal.app when the user invokes "Select All" (scrollback
-  /// included, not just the visible viewport).
+  /// Select scrollback + live screen, matching iTerm2 / Terminal.app's "Select All".
   pub fn select_all(&self) {
     let mut term = self.term.lock();
     let topmost = term.topmost_line();
@@ -223,18 +187,12 @@ impl Terminal {
     self.with_term(|term| term.colors()[index])
   }
 
-  /// Snapshot every visible cell with its style flags, plus the cursor
-  /// position, visibility, shape, and DECSCUSR blink request. Honors the
-  /// current scroll offset: if the user has scrolled into history, the
-  /// snapshot reflects the historical lines, not the live bottom of the
-  /// grid.
+  /// Snapshot the visible viewport (honors `display_offset` for scrollback).
   pub fn snapshot_grid(&self) -> GridSnapshot {
     self.with_term(|term| {
       let cols = term.columns();
       let rows = term.screen_lines();
-      // alacritty grids use negative line numbers for scrollback. When
-      // `display_offset > 0` we're scrolled up; the visible area maps
-      // to grid lines `(row - display_offset)` for `row in 0..rows`.
+      // Visible row `r` maps to alacritty grid line `r - display_offset`.
       let display_offset = term.grid().display_offset() as i32;
       let history_size = term.grid().history_size() as i32;
 
@@ -269,12 +227,7 @@ impl Terminal {
         .map(|row| snapshot_row(row as i32 - display_offset))
         .collect();
 
-      // Overscan: one extra row above and below the visible viewport, used
-      // by the painter to fill the gap during sub-line scroll offsets.
-      // - Top overscan exists iff there's at least one more line in
-      //   scrollback above the topmost visible row.
-      // - Bottom overscan exists iff we're scrolled into history; below
-      //   the viewport then sits more recent content.
+      // Overscan: one extra row above/below the viewport for sub-line scroll fill.
       let overscan_top = if display_offset < history_size {
         Some(snapshot_row(-1 - display_offset))
       } else {
@@ -286,9 +239,6 @@ impl Terminal {
         None
       };
 
-      // Selection range - clipped/normalized by alacritty against the
-      // grid, so the painter doesn't need to worry about the order of
-      // anchor/focus or scrollback edges.
       let selection_range = term.selection.as_ref().and_then(|s| s.to_range(term));
 
       GridSnapshot {
@@ -306,8 +256,6 @@ impl Terminal {
   }
 }
 
-/// One terminal cell flattened for rendering. Color is left as alacritty's
-/// `Color` so the view can apply theme-aware mapping at paint time.
 #[derive(Debug, Clone)]
 pub struct CellSnapshot {
   pub c: char,
@@ -319,31 +267,23 @@ pub struct CellSnapshot {
   pub strikeout: bool,
   pub dim: bool,
   pub inverse: bool,
-  /// Right half of a wide-char pair. Skip rendering its glyph; the left
-  /// neighbor's wide glyph spans both cells visually.
+  /// Right half of a wide-char pair; skip rendering, the left half spans both cells.
   pub wide_spacer: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct GridSnapshot {
   pub rows: Vec<Vec<CellSnapshot>>,
-  /// Row immediately above the topmost visible row, used by the painter
-  /// to fill in during sub-line scroll offset. `None` at the top of
-  /// scrollback (no further history above).
+  /// Row above the topmost visible row; `None` at the top of scrollback.
   pub overscan_top: Option<Vec<CellSnapshot>>,
-  /// Row immediately below the bottommost visible row. `None` when the
-  /// viewport rests at the live tail (`display_offset == 0`).
+  /// Row below the bottommost visible row; `None` at the live tail.
   pub overscan_bottom: Option<Vec<CellSnapshot>>,
   pub cursor: (usize, usize),
   pub cursor_visible: bool,
   pub cursor_shape: alacritty_terminal::vte::ansi::CursorShape,
   pub cursor_blinking: bool,
-  /// Live selection clipped to grid bounds, in absolute alacritty grid
-  /// coordinates. The painter must subtract `display_offset` to translate
-  /// to viewport rows.
+  /// Selection in absolute grid coordinates; painter subtracts `display_offset`.
   pub selection: Option<alacritty_terminal::selection::SelectionRange>,
-  /// Number of lines the user has scrolled up into history. Display row
-  /// `r` corresponds to grid `Line(r as i32 - display_offset as i32)`.
   pub display_offset: usize,
 }
 

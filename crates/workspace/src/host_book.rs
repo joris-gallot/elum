@@ -69,9 +69,6 @@ pub struct HostBook {
 }
 
 impl HostBook {
-  /// Standard location: `~/Library/Application Support/elum/hosts.json` on
-  /// macOS, `$XDG_CONFIG_HOME/elum/hosts.json` on Linux. Falls back to a
-  /// path under the binary's working directory if no data dir is found.
   pub fn default_path() -> PathBuf {
     dirs::data_dir().map_or_else(
       || PathBuf::from("./elum-hosts.json"),
@@ -79,8 +76,7 @@ impl HostBook {
     )
   }
 
-  /// Load from `path`. If the file is absent, returns an empty book.
-  /// Errors only on present-but-corrupt files or unknown schema versions.
+  /// Empty book if the file is absent; errors on corrupt or unknown schema.
   pub fn load_from(path: impl AsRef<Path>) -> Result<Self> {
     let path = path.as_ref().to_path_buf();
     match fs::read_to_string(&path) {

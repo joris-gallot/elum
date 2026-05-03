@@ -1,8 +1,4 @@
-//! SSH transport for Elum.
-//!
-//! Owns a tokio runtime that drives `russh`. Exposes a small async API:
-//! connect, exec, close. Host-key verification is delegated to a caller provided
-//! [`HostKeyPolicy`] so the UI can ask the user when a key is new or has changed
+//! SSH transport over `russh`. Host-key verification is delegated to [`HostKeyPolicy`].
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -59,9 +55,7 @@ impl HostKeyPolicy for AlwaysAccept {
   }
 }
 
-/// Bridges russh's `client::Handler` to our `HostKeyPolicy`. Stores the
-/// connection coordinates so `check_server_key` can consult `known_hosts`
-/// with the right `host:port`.
+/// Bridges russh's `client::Handler` to our `HostKeyPolicy`.
 struct ClientHandler {
   host: String,
   port: u16,
@@ -302,14 +296,8 @@ impl Session {
     Ok(())
   }
 
-  /// Open an interactive shell channel with a PTY. Returns a [`ShellHandle`]
-  /// holding two flume channels: bytes coming from the remote (stdout +
-  /// stderr) and bytes going to the remote (keystrokes). A background tokio
-  /// task drives the bidirectional relay; dropping the handle does NOT
-  /// stop the task by itself - call [`ShellHandle::close`] to shut down.
-  ///
-  /// Consumes `self` because the relay task takes ownership of the SSH
-  /// session for the lifetime of the shell. Re-connect for a new session.
+  /// Open an interactive PTY shell. Consumes `self` because the relay task
+  /// owns the session for its lifetime; call [`ShellHandle::close`] to shut down.
   pub async fn open_shell(self, cols: u16, rows: u16) -> Result<ShellHandle> {
     let channel = self
       .handle
@@ -440,11 +428,7 @@ mod tests {
   use std::sync::Mutex;
   use tempfile::TempDir;
 
-  // Test keys have no OpenSSH comment because russh's `check_known_hosts`
-  // re-parses the file via `parse_public_key_base64`, which never sets a
-  // comment, and `PublicKey`'s derived `PartialEq` compares the comment
-  // field. Keys presented by an actual server over the wire also carry
-  // no comment, so this is faithful to production.
+  // No OpenSSH comment: `PublicKey`'s `PartialEq` includes it, and wire keys carry none.
   const KEY_A: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFpA9qS29zSWIfEGh5E5CnHzVpQPnSQq5fOuRWE6tLeu";
   const KEY_B: &str =

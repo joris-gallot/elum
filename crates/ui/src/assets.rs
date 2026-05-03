@@ -1,11 +1,5 @@
-//! Asset source for the Elum app.
-//!
-//! Scans `crates/ui/assets/` at compile time via `rust-embed`, then
-//! falls back to `gpui-component-assets` for the icons rendered by
-//! `gpui-component` internals (Dialog close, Select chevron, etc.).
-//!
-//! Adding a new asset is just dropping the file under `assets/`. The
-//! type-safe icon enum lives in [`crate::icons::UiIconName`].
+//! `rust-embed` asset source rooted at `crates/ui/assets/`, with `gpui-component-assets`
+//! fallback for icons rendered by gpui-component internals.
 
 use std::borrow::Cow;
 
