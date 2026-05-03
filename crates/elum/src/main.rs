@@ -1,3 +1,4 @@
+#[cfg(debug_assertions)]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -8,7 +9,9 @@ use app_root::AppRoot;
 use gpui::{point, TitlebarOptions};
 use gpui::{px, size, App, AppContext, Bounds, Menu, MenuItem, WindowBounds, WindowOptions};
 use workspace::workspace::{OpenSettings, Quit};
-use workspace::{apply_theme, AppSettings, Host, HostAuth, HostBook, Workspace};
+use workspace::{apply_theme, AppSettings, HostBook, Workspace};
+#[cfg(debug_assertions)]
+use workspace::{Host, HostAuth};
 
 const INITIAL_WIDTH_PX: f32 = 900.0;
 const INITIAL_HEIGHT_PX: f32 = 540.0;
@@ -24,6 +27,7 @@ fn main() {
   );
 
   let host_book_path = HostBook::default_path();
+  #[cfg_attr(not(debug_assertions), allow(unused_mut))]
   let mut host_book = match HostBook::load_from(&host_book_path) {
     Ok(b) => b,
     Err(e) => {
@@ -35,8 +39,8 @@ fn main() {
         .unwrap_or_else(|_| HostBook::load_from(host_book_path.clone()).expect("retry load empty"))
     }
   };
+  #[cfg(debug_assertions)]
   if host_book.is_empty() {
-    // Seed with the default Docker test if the book is empty
     host_book.add(default_docker_host());
     if let Err(e) = host_book.save() {
       eprintln!("warning: could not seed default host book: {e:#}");
@@ -105,8 +109,7 @@ fn build_app_menus() -> Vec<Menu> {
   }]
 }
 
-/// First-launch seed: a host pointing at the local SSH test container so
-/// `cargo run` works out of the box once `docker compose up` is running.
+#[cfg(debug_assertions)]
 fn default_docker_host() -> Host {
   let key_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     .join("..")
