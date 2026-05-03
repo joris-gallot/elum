@@ -22,3 +22,7 @@ cargo run
 - `terminal` - terminal view and rendering
 - `ssh` - SSH transport
 - `ui` - shared UI bits (dialogs, icons)
+
+## Tests
+
+A local `sshd` container is used for integration tests. See [docker/sshd/fixtures/README.md](docker/sshd/fixtures/README.md) for details on the bundled test key.
