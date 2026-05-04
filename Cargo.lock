@@ -7483,9 +7483,11 @@ dependencies = [
  "anyhow",
  "flume",
  "gpui",
+ "gpui-component",
  "parking_lot",
  "polling",
  "serde",
+ "ui",
 ]
 
 [[package]]

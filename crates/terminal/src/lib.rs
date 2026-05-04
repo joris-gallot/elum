@@ -11,10 +11,11 @@ use std::sync::Arc;
 use alacritty_terminal::{
   event::{Event as AlacEvent, EventListener},
   grid::{Dimensions, Scroll},
-  index::{Column, Line, Point as AlacPoint, Side},
+  index::{Column, Direction, Line, Point as AlacPoint, Side},
   selection::{Selection as AlacSelection, SelectionType},
   term::cell::Flags,
   term::color,
+  term::search::{Match, RegexSearch},
   term::Config,
   term::TermMode,
   vte::ansi::{Processor, StdSyncHandler},
@@ -185,6 +186,66 @@ impl Terminal {
       return None;
     }
     self.with_term(|term| term.colors()[index])
+  }
+
+  /// Search for `regex` starting at `origin`. The origin cell is included in
+  /// the candidate range. Bounds are the full scrollback + screen.
+  pub fn regex_search(
+    &self,
+    regex: &mut RegexSearch,
+    origin: AlacPoint,
+    direction: Direction,
+  ) -> Option<Match> {
+    let term = self.term.lock();
+    let last_col = term.last_column();
+    match direction {
+      Direction::Right => {
+        let end = AlacPoint::new(term.bottommost_line(), last_col);
+        term.regex_search_right(regex, origin, end)
+      }
+      Direction::Left => {
+        let end = AlacPoint::new(term.topmost_line(), Column(0));
+        term.regex_search_left(regex, origin, end)
+      }
+    }
+  }
+
+  /// Collect up to `max` matches from the start of scrollback to the bottom of
+  /// the live screen, in left-to-right order. Capped to keep counts cheap on
+  /// large buffers; callers can flag over-cap state via the returned length.
+  pub fn collect_matches(&self, regex: &mut RegexSearch, max: usize) -> Vec<Match> {
+    use alacritty_terminal::term::search::RegexIter;
+    let term = self.term.lock();
+    let last_col = term.last_column();
+    let start = AlacPoint::new(term.topmost_line(), Column(0));
+    let end = AlacPoint::new(term.bottommost_line(), last_col);
+    RegexIter::new(start, end, Direction::Right, &term, regex)
+      .take(max)
+      .collect()
+  }
+
+  /// Highlight `m` as a Simple selection, used by search-next / search-prev.
+  pub fn set_match_selection(&self, m: &Match) {
+    let mut term = self.term.lock();
+    let mut sel = AlacSelection::new(SelectionType::Simple, *m.start(), Side::Left);
+    sel.update(*m.end(), Side::Right);
+    term.selection = Some(sel);
+  }
+
+  /// Bring `line` into the visible viewport (roughly centered when room allows).
+  pub fn scroll_to_line(&self, line: Line) {
+    let mut term = self.term.lock();
+    let screen_lines = term.screen_lines() as i32;
+    let bottommost = term.bottommost_line().0;
+    let history = term.grid().history_size() as i32;
+    // For target line `l`, offset `bottommost - l` puts it on the last visible
+    // row; add half a screen to roughly center it.
+    let target_offset = (bottommost - line.0 + screen_lines / 2).clamp(0, history);
+    let current = term.grid().display_offset() as i32;
+    let delta = target_offset - current;
+    if delta != 0 {
+      term.scroll_display(Scroll::Delta(delta));
+    }
   }
 
   /// Snapshot the visible viewport (honors `display_offset` for scrollback).
@@ -461,5 +522,91 @@ mod tests {
     t.scroll_lines(3);
     let text_after = t.selection_text();
     assert_eq!(text_before, text_after);
+  }
+
+  // ---- Regex search tests -----------------------------------------------
+
+  #[test]
+  fn regex_search_right_finds_match_after_origin() {
+    let t = Terminal::new(GridSize::new(3, 20));
+    t.write_remote(b"foo bar baz");
+    let mut re = RegexSearch::new("bar").unwrap();
+    let m = t
+      .regex_search(&mut re, Point::new(Line(0), Column(0)), Direction::Right)
+      .expect("matches");
+    assert_eq!(*m.start(), Point::new(Line(0), Column(4)));
+    assert_eq!(*m.end(), Point::new(Line(0), Column(6)));
+  }
+
+  #[test]
+  fn regex_search_right_returns_none_when_no_match() {
+    let t = Terminal::new(GridSize::new(3, 20));
+    t.write_remote(b"foo bar baz");
+    let mut re = RegexSearch::new("nope").unwrap();
+    let m = t.regex_search(&mut re, Point::new(Line(0), Column(0)), Direction::Right);
+    assert!(m.is_none());
+  }
+
+  #[test]
+  fn regex_search_left_finds_previous_match() {
+    let t = Terminal::new(GridSize::new(3, 20));
+    t.write_remote(b"foo bar foo");
+    let mut re = RegexSearch::new("foo").unwrap();
+    // Origin at the start of the second "foo": searching left should land
+    // on the first "foo".
+    let m = t
+      .regex_search(&mut re, Point::new(Line(0), Column(7)), Direction::Left)
+      .expect("matches");
+    assert_eq!(*m.start(), Point::new(Line(0), Column(0)));
+    assert_eq!(*m.end(), Point::new(Line(0), Column(2)));
+  }
+
+  #[test]
+  fn regex_search_finds_match_in_scrollback() {
+    let mut size = GridSize::new(3, 10);
+    size.scrollback = 50;
+    let t = Terminal::new(size);
+    for i in 0..15 {
+      t.write_remote(format!("row{i:02}\r\n").as_bytes());
+    }
+    let mut re = RegexSearch::new("row03").unwrap();
+    let m = t
+      .regex_search(&mut re, Point::new(Line(2), Column(9)), Direction::Left)
+      .expect("matches");
+    // row03 was pushed into scrollback (negative Line).
+    assert!(m.start().line.0 < 0, "expected scrollback line, got {m:?}");
+  }
+
+  #[test]
+  fn collect_matches_returns_all_in_left_to_right_order() {
+    let t = Terminal::new(GridSize::new(3, 30));
+    t.write_remote(b"foo bar foo baz foo");
+    let mut re = RegexSearch::new("foo").unwrap();
+    let all = t.collect_matches(&mut re, 100);
+    assert_eq!(all.len(), 3);
+    assert_eq!(*all[0].start(), Point::new(Line(0), Column(0)));
+    assert_eq!(*all[1].start(), Point::new(Line(0), Column(8)));
+    assert_eq!(*all[2].start(), Point::new(Line(0), Column(16)));
+  }
+
+  #[test]
+  fn collect_matches_caps_at_max() {
+    let t = Terminal::new(GridSize::new(3, 30));
+    t.write_remote(b"x x x x x x x x x x");
+    let mut re = RegexSearch::new("x").unwrap();
+    let all = t.collect_matches(&mut re, 3);
+    assert_eq!(all.len(), 3);
+  }
+
+  #[test]
+  fn set_match_selection_paints_match_text() {
+    let t = Terminal::new(GridSize::new(3, 20));
+    t.write_remote(b"foo bar baz");
+    let mut re = RegexSearch::new("bar").unwrap();
+    let m = t
+      .regex_search(&mut re, Point::new(Line(0), Column(0)), Direction::Right)
+      .unwrap();
+    t.set_match_selection(&m);
+    assert_eq!(t.selection_text(), Some("bar".to_string()));
   }
 }

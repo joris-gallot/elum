@@ -1,0 +1,131 @@
+=== ELUM SEARCH FIXTURE - test buffer for Cmd+F ===
+Things to try:
+  - Type a level keyword and check "X of N" against your eyeballs.
+  - Smart-case: lowercase query is case-insensitive, mixed-case is exact.
+  - Regex: try patterns like "err(or)?" or "worker-[0-9]" or "\bGET\b".
+  - Three unique markers exist below: alpha, beta, gamma.
+
+--- Section 1: boot sequence ---
+2026-05-04T08:00:00Z INFO  boot: starting elum-test
+2026-05-04T08:00:00Z INFO  boot: loading config from /etc/elum.conf
+2026-05-04T08:00:00Z DEBUG boot: parsed 24 keys
+2026-05-04T08:00:01Z INFO  boot: opening listener on 0.0.0.0:8080
+2026-05-04T08:00:01Z TRACE boot: socket fd=7
+2026-05-04T08:00:01Z INFO  boot: ready
+2026-05-04T08:00:02Z DEBUG boot: gc cycle 0 freed 0 bytes
+2026-05-04T08:00:03Z INFO  net : accepted conn from 10.0.0.42
+2026-05-04T08:00:03Z DEBUG net : tls handshake started
+2026-05-04T08:00:03Z DEBUG net : tls handshake ok
+2026-05-04T08:00:04Z INFO  auth: login user=alice
+2026-05-04T08:00:04Z DEBUG auth: bcrypt cost=12
+2026-05-04T08:00:05Z WARN  auth: rate limit near threshold for 10.0.0.42
+2026-05-04T08:00:05Z INFO  auth: session opened sid=ab12
+
+--- Section 2: requests ---
+2026-05-04T08:01:00Z INFO  http: GET /api/users 200 4ms
+2026-05-04T08:01:00Z DEBUG http: cache miss key=users:list
+2026-05-04T08:01:01Z INFO  http: GET /api/users/42 200 1ms
+2026-05-04T08:01:01Z DEBUG http: cache hit key=user:42
+2026-05-04T08:01:02Z INFO  http: POST /api/login 200 17ms
+2026-05-04T08:01:03Z WARN  http: slow query 142ms route=/api/reports
+2026-05-04T08:01:03Z INFO  http: GET /api/reports 200 145ms
+2026-05-04T08:01:04Z ERROR http: 500 internal error route=/api/reports/42
+2026-05-04T08:01:04Z DEBUG http: stack=at handler.rs:88
+2026-05-04T08:01:05Z INFO  http: GET /api/health 200 0ms
+2026-05-04T08:01:06Z INFO  http: GET /api/users 200 3ms
+2026-05-04T08:01:07Z WARN  http: deprecated header X-Legacy-Auth seen
+2026-05-04T08:01:08Z INFO  http: POST /api/users 201 9ms
+2026-05-04T08:01:09Z INFO  http: needle-alpha first unique marker here
+2026-05-04T08:01:10Z DEBUG http: keepalive recycled conn=99
+2026-05-04T08:01:11Z INFO  http: GET /api/users 200 2ms
+2026-05-04T08:01:12Z INFO  http: GET /api/users/42 304 0ms
+2026-05-04T08:01:13Z WARN  http: missing Content-Type, defaulted to text/plain
+2026-05-04T08:01:14Z INFO  http: GET /api/users 200 4ms
+
+--- Section 3: workers ---
+2026-05-04T08:02:00Z INFO  job : starting worker pool size=8
+2026-05-04T08:02:00Z DEBUG job : worker-0 started
+2026-05-04T08:02:00Z DEBUG job : worker-1 started
+2026-05-04T08:02:00Z DEBUG job : worker-2 started
+2026-05-04T08:02:00Z DEBUG job : worker-3 started
+2026-05-04T08:02:00Z DEBUG job : worker-4 started
+2026-05-04T08:02:00Z DEBUG job : worker-5 started
+2026-05-04T08:02:00Z DEBUG job : worker-6 started
+2026-05-04T08:02:00Z DEBUG job : worker-7 started
+2026-05-04T08:02:01Z INFO  job : queue depth=42 oldest=4s
+2026-05-04T08:02:02Z WARN  job : worker-3 lagging avg=900ms
+2026-05-04T08:02:03Z ERROR job : worker-5 panic at compute.rs:204
+2026-05-04T08:02:03Z ERROR job : restarting worker-5
+2026-05-04T08:02:04Z INFO  job : worker-5 restarted
+2026-05-04T08:02:05Z INFO  job : queue depth=18
+2026-05-04T08:02:06Z TRACE job : task t-3001 done in 12ms
+2026-05-04T08:02:07Z TRACE job : task t-3002 done in 9ms
+2026-05-04T08:02:08Z INFO  job : queue depth=2
+2026-05-04T08:02:09Z INFO  job : needle-beta second unique marker here
+
+--- Section 4: storage ---
+2026-05-04T08:03:00Z INFO  db  : connection pool ready min=2 max=16
+2026-05-04T08:03:01Z DEBUG db  : checkout conn=3
+2026-05-04T08:03:01Z DEBUG db  : SELECT id, name FROM users WHERE org_id = $1
+2026-05-04T08:03:01Z DEBUG db  : returned 12 rows in 1ms
+2026-05-04T08:03:02Z WARN  db  : long-held checkout conn=7 1.4s
+2026-05-04T08:03:03Z INFO  db  : checkpoint started
+2026-05-04T08:03:04Z INFO  db  : checkpoint done 2.3MB written
+2026-05-04T08:03:05Z ERROR db  : duplicate key violation table=users key=42
+2026-05-04T08:03:06Z WARN  db  : autovacuum delayed
+2026-05-04T08:03:07Z INFO  db  : VACUUM FULL on cache_entries
+2026-05-04T08:03:08Z INFO  db  : VACUUM done in 4.1s
+2026-05-04T08:03:09Z DEBUG db  : pool: 6 idle, 10 in-use, 0 waiting
+2026-05-04T08:03:10Z INFO  db  : replication lag = 12ms
+
+--- Section 5: trouble ---
+2026-05-04T08:04:00Z WARN  net : tcp retransmit observed peer=10.0.0.7
+2026-05-04T08:04:01Z ERROR net : connection reset by peer 10.0.0.7
+2026-05-04T08:04:02Z WARN  net : reconnect backoff=1s
+2026-05-04T08:04:03Z WARN  net : reconnect backoff=2s
+2026-05-04T08:04:04Z WARN  net : reconnect backoff=4s
+2026-05-04T08:04:05Z ERROR net : reconnect failed after 5 attempts
+2026-05-04T08:04:06Z INFO  net : circuit breaker opened
+2026-05-04T08:04:07Z WARN  net : dropping non-critical telemetry
+2026-05-04T08:04:08Z INFO  net : circuit breaker half-open
+2026-05-04T08:04:09Z INFO  net : circuit breaker closed
+2026-05-04T08:04:10Z DEBUG net : socket buffers cleared
+2026-05-04T08:04:11Z ERR   net : OOM-killed child pid=2042
+2026-05-04T08:04:12Z INFO  net : restarted child pid=2143
+
+--- Section 6: misc text for variety ---
+The quick brown fox jumps over the lazy dog. THE QUICK BROWN FOX.
+Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.
+Ut enim ad minim veniam, quis nostrud exercitation ullamco.
+Duis aute irure dolor in reprehenderit in voluptate velit esse.
+Excepteur sint occaecat cupidatat non proident, sunt in culpa.
+Special chars: () [] {} <> | & ; * ? . + ^ $ \ " '
+Unicode: café, naïve, jalapeño, 日本語, emoji 🔍 🛠️ 🚀
+Numbers: 0 1 2 3 5 8 13 21 34 55 89 144 233 377 610 987
+Mixed:    ERROR123 error456 Error789 ERR_ZERO
+
+--- Section 7: more INFO lines for counter test ---
+2026-05-04T08:05:00Z INFO  filler 1
+2026-05-04T08:05:01Z INFO  filler 2
+2026-05-04T08:05:02Z INFO  filler 3
+2026-05-04T08:05:03Z INFO  filler 4
+2026-05-04T08:05:04Z INFO  filler 5
+2026-05-04T08:05:05Z INFO  filler 6
+2026-05-04T08:05:06Z INFO  filler 7
+2026-05-04T08:05:07Z INFO  filler 8
+2026-05-04T08:05:08Z INFO  filler 9
+2026-05-04T08:05:09Z INFO  filler 10
+2026-05-04T08:05:10Z INFO  filler 11
+2026-05-04T08:05:11Z INFO  filler 12
+2026-05-04T08:05:12Z INFO  filler 13
+2026-05-04T08:05:13Z INFO  filler 14
+2026-05-04T08:05:14Z INFO  filler 15
+2026-05-04T08:05:15Z INFO  needle-gamma third unique marker here
+2026-05-04T08:05:16Z INFO  filler 16
+2026-05-04T08:05:17Z INFO  filler 17
+2026-05-04T08:05:18Z INFO  filler 18
+2026-05-04T08:05:19Z INFO  filler 19
+2026-05-04T08:05:20Z INFO  filler 20
+
+=== END OF FIXTURE ===

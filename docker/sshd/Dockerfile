@@ -11,9 +11,11 @@ RUN apk add --no-cache openssh-server bash \
  && chmod 700 /home/testuser/.ssh
 
 COPY fixtures/id_ed25519.pub /home/testuser/.ssh/authorized_keys
+COPY fixtures/search-fixture.txt /home/testuser/search-fixture.txt
 
 RUN chown -R testuser:testuser /home/testuser/.ssh \
- && chmod 600 /home/testuser/.ssh/authorized_keys
+ && chmod 600 /home/testuser/.ssh/authorized_keys \
+ && chown testuser:testuser /home/testuser/search-fixture.txt
 
 # Lock down sshd: no passwords, no root, single allowed user.
 RUN printf '%s\n' \

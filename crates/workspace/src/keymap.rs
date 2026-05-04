@@ -4,7 +4,9 @@ use gpui::{App, KeyBinding};
 
 use crate::workspace::{self, KEY_CONTEXT as WORKSPACE_CONTEXT, PAGE_KEY_CONTEXT as PAGE_CONTEXT};
 use terminal::view::{
-  Copy as TerminalCopy, Paste as TerminalPaste, SelectAll as TerminalSelectAll,
+  Copy as TerminalCopy, Paste as TerminalPaste, Search as TerminalSearch,
+  SearchDismiss as TerminalSearchDismiss, SearchNext as TerminalSearchNext,
+  SearchPrev as TerminalSearchPrev, SelectAll as TerminalSelectAll,
   KEY_CONTEXT as TERMINAL_CONTEXT,
 };
 
@@ -14,6 +16,10 @@ pub fn install(cx: &mut App) {
     KeyBinding::new("cmd-c", TerminalCopy, Some(TERMINAL_CONTEXT)),
     KeyBinding::new("cmd-v", TerminalPaste, Some(TERMINAL_CONTEXT)),
     KeyBinding::new("cmd-a", TerminalSelectAll, Some(TERMINAL_CONTEXT)),
+    KeyBinding::new("cmd-f", TerminalSearch, Some(TERMINAL_CONTEXT)),
+    KeyBinding::new("cmd-g", TerminalSearchNext, Some(TERMINAL_CONTEXT)),
+    KeyBinding::new("cmd-shift-g", TerminalSearchPrev, Some(TERMINAL_CONTEXT)),
+    KeyBinding::new("escape", TerminalSearchDismiss, Some(TERMINAL_CONTEXT)),
     // Workspace-scoped: fires from anywhere in the workspace
     KeyBinding::new("cmd-w", workspace::CloseTab, Some(WORKSPACE_CONTEXT)),
     KeyBinding::new("cmd-shift-]", workspace::NextTab, Some(WORKSPACE_CONTEXT)),

@@ -11,15 +11,35 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alacritty_terminal::event::{Event as AlacEvent, WindowSize};
+use alacritty_terminal::grid::Dimensions as _;
+use alacritty_terminal::index::Direction;
 use alacritty_terminal::selection::SelectionType;
+use alacritty_terminal::term::search::{Match, RegexSearch};
 use alacritty_terminal::term::TermMode;
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
-  actions, div, px, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
-  InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, ParentElement, Pixels,
-  Point, Render, ScrollWheelEvent, Styled, Subscription, Task, TouchPhase, Window,
+  actions, div, px, AppContext as _, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle,
+  Focusable, InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, ParentElement,
+  Pixels, Point, Render, ScrollWheelEvent, SharedString, Styled, Subscription, Task, TouchPhase,
+  Window,
 };
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::{ActiveTheme as _, Disableable as _, IconName, Sizable as _};
+use ui::UiIconName;
 
-actions!(terminal, [Copy, Paste, SelectAll,]);
+actions!(
+  terminal,
+  [
+    Copy,
+    Paste,
+    SelectAll,
+    Search,
+    SearchNext,
+    SearchPrev,
+    SearchDismiss,
+  ]
+);
 
 pub const KEY_CONTEXT: &str = "TerminalView";
 
@@ -66,10 +86,29 @@ pub struct TerminalView {
   /// element with an underline overlay at the cursor position.
   marked_text: Option<String>,
   focus: FocusHandle,
+  search: Option<SearchState>,
   _focus_in: Option<Subscription>,
   _focus_out: Option<Subscription>,
   _relay: Task<()>,
   _blink: Task<()>,
+}
+
+/// Cap on `collect_matches` to keep "X of N" cheap on huge scrollbacks.
+const MAX_MATCH_COUNT: usize = 1000;
+
+struct SearchState {
+  input: gpui::Entity<InputState>,
+  regex: Option<RegexSearch>,
+  current: Option<Match>,
+  no_match: bool,
+  /// Index of `current` in the full match list, 0-based. `None` until a match
+  /// is found or after a wrap.
+  current_index: Option<usize>,
+  /// Total matches in buffer, capped at `MAX_MATCH_COUNT`.
+  total: usize,
+  /// True when the buffer has more than `MAX_MATCH_COUNT` matches.
+  total_capped: bool,
+  _input_subscription: Subscription,
 }
 
 impl TerminalView {
@@ -132,6 +171,7 @@ impl TerminalView {
       cursor_blink_phase: true,
       marked_text: None,
       focus,
+      search: None,
       _focus_in: None,
       _focus_out: None,
       _relay: relay,
@@ -187,8 +227,13 @@ impl TerminalView {
     cx.notify();
   }
 
-  fn handle_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+  fn handle_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, _cx: &mut Context<Self>) {
     // Bound app shortcuts (Cmd-C/V/A) go through `on_action` and never reach here.
+    // The search input is a descendant of this div, so its keystrokes bubble up;
+    // skip the PTY relay unless focus is directly on the terminal.
+    if !self.focus.is_focused(window) {
+      return;
+    }
     let mode = self.terminal.with_term(|term| *term.mode());
     if let Some(bytes) = keystroke_to_bytes(&ev.keystroke, mode) {
       // Typing engages the live shell: snap to bottom and clear stale selection.
@@ -219,6 +264,163 @@ impl TerminalView {
 
   fn on_select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
     self.select_all(cx);
+  }
+
+  fn on_search(&mut self, _: &Search, window: &mut Window, cx: &mut Context<Self>) {
+    if let Some(state) = &self.search {
+      let handle = state.input.read(cx).focus_handle(cx);
+      window.focus(&handle, cx);
+      return;
+    }
+
+    let input = cx.new(|cx| InputState::new(window, cx).placeholder("Find"));
+    let sub = cx.subscribe(&input, |this, _, ev: &InputEvent, cx| match ev {
+      InputEvent::Change => this.on_search_text_changed(cx),
+      InputEvent::PressEnter { .. } => this.search_step(Direction::Right, cx),
+      InputEvent::Focus | InputEvent::Blur => cx.notify(),
+    });
+    let handle = input.read(cx).focus_handle(cx);
+    self.search = Some(SearchState {
+      input,
+      regex: None,
+      current: None,
+      no_match: false,
+      current_index: None,
+      total: 0,
+      total_capped: false,
+      _input_subscription: sub,
+    });
+    window.focus(&handle, cx);
+    cx.notify();
+  }
+
+  fn on_search_next(&mut self, _: &SearchNext, _window: &mut Window, cx: &mut Context<Self>) {
+    self.search_step(Direction::Right, cx);
+  }
+
+  fn on_search_prev(&mut self, _: &SearchPrev, _window: &mut Window, cx: &mut Context<Self>) {
+    self.search_step(Direction::Left, cx);
+  }
+
+  fn on_search_dismiss(&mut self, _: &SearchDismiss, window: &mut Window, cx: &mut Context<Self>) {
+    if self.search.take().is_some() {
+      self.terminal.clear_selection();
+      window.focus(&self.focus, cx);
+      cx.notify();
+    }
+  }
+
+  fn on_search_text_changed(&mut self, cx: &mut Context<Self>) {
+    let Some(state) = self.search.as_mut() else {
+      return;
+    };
+    let query = state.input.read(cx).value().to_string();
+    if query.is_empty() {
+      state.regex = None;
+      state.current = None;
+      state.no_match = false;
+      state.current_index = None;
+      state.total = 0;
+      state.total_capped = false;
+      self.terminal.clear_selection();
+      cx.notify();
+      return;
+    }
+    state.regex = RegexSearch::new(&query).ok();
+    state.current = None;
+    state.current_index = None;
+    if state.regex.is_none() {
+      state.no_match = true;
+      state.total = 0;
+      state.total_capped = false;
+      self.terminal.clear_selection();
+      cx.notify();
+      return;
+    }
+    // Anchor the first search at the bottom of the viewport so the freshest
+    // matches surface first; the user can press Cmd+Shift+G to walk older ones.
+    self.search_step(Direction::Left, cx);
+  }
+
+  fn search_step(&mut self, direction: Direction, cx: &mut Context<Self>) {
+    let Some(state) = self.search.as_mut() else {
+      return;
+    };
+    let Some(mut regex) = state.regex.take() else {
+      return;
+    };
+    let origin = self.compute_search_origin(direction);
+    let mut result = self.terminal.regex_search(&mut regex, origin, direction);
+    // Wrap to the opposite edge so Enter / Cmd+G keeps cycling instead of dead-ending.
+    if result.is_none() {
+      let wrap = self.wrap_origin(direction);
+      result = self.terminal.regex_search(&mut regex, wrap, direction);
+    }
+
+    // Refresh the cached total + index whenever we step. Cheap on small
+    // buffers; capped at MAX_MATCH_COUNT for large ones.
+    let all = self
+      .terminal
+      .collect_matches(&mut regex, MAX_MATCH_COUNT + 1);
+    let total_capped = all.len() > MAX_MATCH_COUNT;
+    let total = all.len().min(MAX_MATCH_COUNT);
+    let current_index = result
+      .as_ref()
+      .and_then(|m| all.iter().take(total).position(|x| x.start() == m.start()));
+
+    let state = self.search.as_mut().unwrap();
+    state.regex = Some(regex);
+    state.total = total;
+    state.total_capped = total_capped;
+    state.current_index = current_index;
+    match result {
+      Some(m) => {
+        self.terminal.set_match_selection(&m);
+        self.terminal.scroll_to_line(m.start().line);
+        state.current = Some(m);
+        state.no_match = false;
+      }
+      None => {
+        state.no_match = true;
+      }
+    }
+    cx.notify();
+  }
+
+  fn wrap_origin(&self, direction: Direction) -> alacritty_terminal::index::Point {
+    use alacritty_terminal::index::{Column, Point as AlacPoint};
+    let cols = self.last_size.map_or(80, |(_, c)| c) as usize;
+    match direction {
+      Direction::Right => AlacPoint::new(self.topmost_line(), Column(0)),
+      Direction::Left => AlacPoint::new(self.bottommost_line(), Column(cols.saturating_sub(1))),
+    }
+  }
+
+  fn compute_search_origin(&self, direction: Direction) -> alacritty_terminal::index::Point {
+    use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+    let cols = self.last_size.map_or(80, |(_, c)| c) as usize;
+    let last_col = Column(cols.saturating_sub(1));
+    let state = self.search.as_ref();
+    let current = state.and_then(|s| s.current.as_ref());
+
+    match (current, direction) {
+      (Some(m), Direction::Right) => step_after(*m.end(), cols),
+      (Some(m), Direction::Left) => {
+        step_before(*m.start(), cols).unwrap_or_else(|| AlacPoint::new(Line(0), Column(0)))
+      }
+      // Initial search: anchor at the bottom of the live screen, scanning
+      // backwards into scrollback (Direction::Left).
+      (None, Direction::Left) => AlacPoint::new(self.bottommost_line(), last_col),
+      (None, Direction::Right) => AlacPoint::new(self.topmost_line(), Column(0)),
+    }
+  }
+
+  fn topmost_line(&self) -> alacritty_terminal::index::Line {
+    self.terminal.with_term(|t| t.topmost_line())
+  }
+
+  fn bottommost_line(&self) -> alacritty_terminal::index::Line {
+    self.terminal.with_term(|t| t.bottommost_line())
   }
 
   fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
@@ -666,6 +868,38 @@ fn mouse_cell((row, col): (usize, usize)) -> MouseCell {
   MouseCell::new(row, col)
 }
 
+/// Move one cell forward, wrapping to the next line at end-of-row.
+fn step_after(
+  p: alacritty_terminal::index::Point,
+  cols: usize,
+) -> alacritty_terminal::index::Point {
+  use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+  if p.column.0 + 1 < cols {
+    AlacPoint::new(p.line, Column(p.column.0 + 1))
+  } else {
+    AlacPoint::new(Line(p.line.0 + 1), Column(0))
+  }
+}
+
+/// Move one cell backward, wrapping to the previous line at start-of-row.
+/// Returns `None` if `p` is `(Line(MIN), Column(0))` (no preceding cell).
+fn step_before(
+  p: alacritty_terminal::index::Point,
+  cols: usize,
+) -> Option<alacritty_terminal::index::Point> {
+  use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+  if p.column.0 > 0 {
+    Some(AlacPoint::new(p.line, Column(p.column.0 - 1)))
+  } else if p.line.0 > i32::MIN {
+    Some(AlacPoint::new(
+      Line(p.line.0 - 1),
+      Column(cols.saturating_sub(1)),
+    ))
+  } else {
+    None
+  }
+}
+
 fn focus_report(focused: bool, mode: alacritty_terminal::term::TermMode) -> Option<Vec<u8>> {
   if !mode.contains(alacritty_terminal::term::TermMode::FOCUS_IN_OUT) {
     return None;
@@ -686,15 +920,20 @@ impl Render for TerminalView {
       .copied()
       .unwrap_or_default();
 
-    div()
+    let mut root = div()
       .id("terminal-view")
       .key_context(KEY_CONTEXT)
       .track_focus(&self.focus)
       .on_action(cx.listener(Self::on_copy))
       .on_action(cx.listener(Self::on_paste))
       .on_action(cx.listener(Self::on_select_all))
+      .on_action(cx.listener(Self::on_search))
+      .on_action(cx.listener(Self::on_search_next))
+      .on_action(cx.listener(Self::on_search_prev))
+      .on_action(cx.listener(Self::on_search_dismiss))
       .on_key_down(cx.listener(Self::handle_key_down))
       .size_full()
+      .relative()
       .bg(theme.background)
       .text_color(theme.foreground)
       .font_family(FONT_FAMILY)
@@ -705,7 +944,114 @@ impl Render for TerminalView {
         cx.entity().downgrade(),
         focused,
         blink_phase,
-      ))
+      ));
+
+    if let Some(state) = &self.search {
+      root = root.child(self.render_search_bar(state, window, cx));
+    }
+
+    root
+  }
+}
+
+impl TerminalView {
+  fn render_search_bar(
+    &self,
+    state: &SearchState,
+    window: &Window,
+    cx: &mut Context<Self>,
+  ) -> impl IntoElement + use<> {
+    let theme = cx.theme();
+    let input_handle = state.input.read(cx).focus_handle(cx);
+    let input_focused = input_handle.is_focused(window);
+    let mut bar = gpui_component::h_flex()
+      .id("terminal-search-bar")
+      .occlude()
+      .absolute()
+      .top_2()
+      .right_2()
+      .gap_2()
+      .items_center()
+      .px_2()
+      .py_1()
+      .rounded_md()
+      .bg(theme.popover)
+      .text_color(theme.popover_foreground)
+      .text_size(px(13.))
+      .font_family(".SystemUIFont")
+      .border_1()
+      .border_color(theme.border)
+      .on_mouse_down(
+        gpui::MouseButton::Left,
+        cx.listener(move |_, _, window, cx| {
+          window.focus(&input_handle, cx);
+        }),
+      )
+      .child(
+        div()
+          .flex_1()
+          .rounded_sm()
+          .border_1()
+          .when_else(
+            input_focused,
+            |this| this.border_color(theme.ring),
+            |this| this.border_color(gpui::transparent_black()),
+          )
+          .child(Input::new(&state.input).appearance(false).w(px(200.0))),
+      );
+
+    let (label_text, label_color) = if let Some(idx) = state.current_index {
+      let suffix = if state.total_capped { "+" } else { "" };
+      (
+        format!("{} of {}{suffix}", idx + 1, state.total),
+        theme.muted_foreground,
+      )
+    } else if state.no_match {
+      ("no match".into(), theme.danger)
+    } else {
+      ("no match".into(), theme.muted_foreground)
+    };
+    bar = bar.child(
+      div()
+        .w(px(60.))
+        .text_color(label_color)
+        .text_size(px(11.))
+        .child(SharedString::from(label_text)),
+    );
+
+    let nav_disabled = state.no_match || state.regex.is_none();
+    bar = bar
+      .child(
+        Button::new("search-prev")
+          .icon(UiIconName::ArrowUp)
+          .ghost()
+          .xsmall()
+          .disabled(nav_disabled)
+          .on_click(cx.listener(|this, _, window, cx| {
+            this.on_search_prev(&SearchPrev, window, cx);
+          })),
+      )
+      .child(
+        Button::new("search-next")
+          .icon(UiIconName::ArrowDown)
+          .ghost()
+          .xsmall()
+          .disabled(nav_disabled)
+          .on_click(cx.listener(|this, _, window, cx| {
+            this.on_search_next(&SearchNext, window, cx);
+          })),
+      )
+      .child(
+        Button::new("search-close")
+          .icon(IconName::Close)
+          .ghost()
+          .xsmall()
+          .on_click(cx.listener(|this, _, window, cx| {
+            this.on_search_dismiss(&SearchDismiss, window, cx);
+          })),
+      );
+
+    bar
   }
 }
 
@@ -848,7 +1194,7 @@ mod focus_report_tests {
 #[cfg(test)]
 mod view_tests {
   use super::*;
-  use gpui::{AppContext as _, Bounds, Entity, Size, TestAppContext};
+  use gpui::{Bounds, Entity, Size, TestAppContext};
 
   #[derive(Debug, PartialEq, Eq)]
   enum Captured {
