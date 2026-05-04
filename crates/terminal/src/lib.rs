@@ -614,4 +614,137 @@ mod tests {
     let all = t.collect_matches(&mut re, 3);
     assert_eq!(all.len(), 3);
   }
+
+  // ---- matches_in_viewport ----
+
+  fn fill_buffer(t: &Terminal, lines: usize, prefix: &str) {
+    for i in 0..lines {
+      t.write_remote(format!("{prefix}{i:02}\r\n").as_bytes());
+    }
+  }
+
+  #[test]
+  fn matches_in_viewport_excludes_hidden_scrollback() {
+    let mut size = GridSize::new(5, 20);
+    size.scrollback = 100;
+    let t = Terminal::new(size);
+    // 30 lines: only the last 5 are on the live screen, rest is in scrollback.
+    fill_buffer(&t, 30, "hit");
+    let mut re = RegexSearch::new("hit").unwrap();
+    let visible = t.matches_in_viewport(&mut re, 100);
+    // Each visible row carries one "hit". Cursor sits on the row after the
+    // last write, so we expect ~5 visible matches plus or minus one.
+    assert!(
+      visible.len() <= 5 && visible.len() >= 4,
+      "expected up to one match per visible row, got {}",
+      visible.len()
+    );
+    // None of the visible matches should have a negative line (those are in scrollback).
+    assert!(visible.iter().all(|m| m.start().line.0 >= 0));
+  }
+
+  #[test]
+  fn matches_in_viewport_updates_after_scroll() {
+    let mut size = GridSize::new(3, 20);
+    size.scrollback = 100;
+    let t = Terminal::new(size);
+    fill_buffer(&t, 30, "hit");
+
+    let live = {
+      let mut re = RegexSearch::new("hit").unwrap();
+      t.matches_in_viewport(&mut re, 100)
+    };
+    t.scroll_lines(20);
+    let scrolled = {
+      let mut re = RegexSearch::new("hit").unwrap();
+      t.matches_in_viewport(&mut re, 100)
+    };
+
+    // Same regex, different viewport: line numbers shift but counts are similar.
+    assert!(!live.is_empty() && !scrolled.is_empty());
+    let live_lines: Vec<i32> = live.iter().map(|m| m.start().line.0).collect();
+    let scrolled_lines: Vec<i32> = scrolled.iter().map(|m| m.start().line.0).collect();
+    assert_ne!(
+      live_lines, scrolled_lines,
+      "scroll should change the visible match window"
+    );
+  }
+
+  // ---- scroll_to_line ----
+
+  fn display_offset(t: &Terminal) -> i32 {
+    t.with_term(|term| term.grid().display_offset() as i32)
+  }
+
+  #[test]
+  fn scroll_to_line_no_op_when_already_visible() {
+    let mut size = GridSize::new(10, 20);
+    size.scrollback = 100;
+    let t = Terminal::new(size);
+    fill_buffer(&t, 30, "row");
+    // Currently anchored at the live tail (display_offset = 0), so the bottom
+    // ~10 lines are visible. Pick a line in the middle of that band.
+    let bottommost = t.with_term(|term| term.bottommost_line().0);
+    let middle = Line(bottommost - 4);
+    let before = display_offset(&t);
+    t.scroll_to_line(middle);
+    assert_eq!(
+      display_offset(&t),
+      before,
+      "comfortably visible line should not trigger a scroll"
+    );
+  }
+
+  #[test]
+  fn scroll_to_line_centers_offscreen_match() {
+    let mut size = GridSize::new(10, 20);
+    size.scrollback = 100;
+    let t = Terminal::new(size);
+    fill_buffer(&t, 50, "row");
+
+    // Pick a line deep in scrollback (clearly outside the 10-row viewport).
+    let bottommost = t.with_term(|term| term.bottommost_line().0);
+    let target = Line(bottommost - 30);
+    t.scroll_to_line(target);
+
+    // After scroll, target should sit roughly at the middle visible row.
+    let off = display_offset(&t);
+    let visible_top = bottommost - off - 10 + 1;
+    let row_in_view = target.0 - visible_top;
+    assert!(
+      (3..=7).contains(&row_in_view),
+      "expected target near center (3..=7), got row {row_in_view}"
+    );
+  }
+
+  #[test]
+  fn scroll_to_line_clamps_at_top_of_history() {
+    let mut size = GridSize::new(5, 20);
+    size.scrollback = 20;
+    let t = Terminal::new(size);
+    fill_buffer(&t, 30, "row");
+
+    let topmost = t.with_term(|term| term.topmost_line().0);
+    t.scroll_to_line(Line(topmost));
+    // Can't scroll further than history_size; offset should equal the upper bound.
+    let history = t.history_size() as i32;
+    assert_eq!(display_offset(&t), history);
+  }
+
+  #[test]
+  fn scroll_to_line_clamps_at_live_tail() {
+    let mut size = GridSize::new(5, 20);
+    size.scrollback = 50;
+    let t = Terminal::new(size);
+    fill_buffer(&t, 30, "row");
+    // Scroll up first so we have somewhere to come back from.
+    t.scroll_lines(10);
+    let bottommost = t.with_term(|term| term.bottommost_line().0);
+    t.scroll_to_line(Line(bottommost));
+    assert_eq!(
+      display_offset(&t),
+      0,
+      "live-tail line should bring us all the way back"
+    );
+  }
 }

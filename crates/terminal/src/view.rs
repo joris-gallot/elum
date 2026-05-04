@@ -430,17 +430,27 @@ impl TerminalView {
   }
 
   fn compute_search_origin(&self, direction: Direction) -> alacritty_terminal::index::Point {
-    use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+    use alacritty_terminal::index::{Column, Point as AlacPoint};
     let cols = self.last_size.map_or(80, |(_, c)| c) as usize;
     let last_col = Column(cols.saturating_sub(1));
     let state = self.search.as_ref();
     let current = state.and_then(|s| s.current.as_ref());
 
     match (current, direction) {
-      (Some(m), Direction::Right) => step_after(*m.end(), cols),
-      (Some(m), Direction::Left) => {
-        step_before(*m.start(), cols).unwrap_or_else(|| AlacPoint::new(Line(0), Column(0)))
+      // Stepping past the buffer edge would land on a line alacritty's grid panics on;
+      // fall back to the wrap origin so the next search becomes the wrap-around itself.
+      (Some(m), Direction::Right) => {
+        let p = step_after(*m.end(), cols);
+        if p.line.0 > self.bottommost_line().0 {
+          self.wrap_origin(Direction::Right)
+        } else {
+          p
+        }
       }
+      (Some(m), Direction::Left) => match step_before(*m.start(), cols) {
+        Some(p) if p.line.0 >= self.topmost_line().0 => p,
+        _ => self.wrap_origin(Direction::Left),
+      },
       (None, Direction::Left) => AlacPoint::new(self.bottommost_line(), last_col),
       (None, Direction::Right) => AlacPoint::new(self.topmost_line(), Column(0)),
     }
@@ -1485,6 +1495,166 @@ mod view_tests {
     assert!(
       rig.to_remote_rx.try_recv().is_err(),
       "empty commit must not write to the PTY"
+    );
+  }
+
+  // ---- Search state machine ----------------------------------------------
+
+  use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
+  use alacritty_terminal::selection::SelectionType;
+  use gpui::VisualTestContext;
+
+  /// Builds a TerminalView attached to a real test window so action handlers
+  /// that need `&mut Window` can be invoked.
+  fn make_search_rig(
+    cx: &mut TestAppContext,
+  ) -> (Entity<TerminalView>, Arc<Terminal>, &mut VisualTestContext) {
+    cx.update(|cx| gpui_component::init(cx));
+    let terminal = Arc::new(Terminal::new(GridSize::new(24, 80)));
+    let (_from_remote_tx, from_remote_rx) = flume::unbounded::<Vec<u8>>();
+    let (to_remote_tx, _to_remote_rx) = flume::unbounded::<Vec<u8>>();
+    let (resize_tx, _resize_rx) = flume::unbounded::<(u16, u16)>();
+    let term_clone = terminal.clone();
+    // gpui-component's `Root` must be the window root for InputState to function;
+    // we capture the inner TerminalView via a shared cell so tests can drive it.
+    let view_holder: std::rc::Rc<std::cell::RefCell<Option<Entity<TerminalView>>>> =
+      std::rc::Rc::new(std::cell::RefCell::new(None));
+    let view_holder_clone = view_holder.clone();
+    let (_root, vcx) = cx.add_window_view(move |window, cx| {
+      let inner =
+        cx.new(|cx| TerminalView::new(term_clone, from_remote_rx, to_remote_tx, resize_tx, (), cx));
+      *view_holder_clone.borrow_mut() = Some(inner.clone());
+      gpui_component::Root::new(inner, window, cx)
+    });
+    let view = view_holder.borrow().as_ref().unwrap().clone();
+    (view, terminal, vcx)
+  }
+
+  fn set_query(view: &Entity<TerminalView>, cx: &mut VisualTestContext, q: &str) {
+    view.update_in(cx, |v: &mut TerminalView, window, cx| {
+      let input = v.search.as_ref().expect("search open").input.clone();
+      input.update(cx, |s, cx| s.set_value(q, window, cx));
+      v.on_search_text_changed(cx);
+    });
+  }
+
+  #[gpui::test]
+  async fn search_lands_on_first_match(cx: &mut TestAppContext) {
+    let (view, terminal, cx) = make_search_rig(cx);
+    terminal.write_remote(b"foo bar foo baz");
+
+    view.update_in(cx, |v, window, cx| v.on_search(&Search, window, cx));
+    set_query(&view, cx, "foo");
+
+    view.read_with(cx, |v, _| {
+      let s = v.search.as_ref().expect("open");
+      assert_eq!(s.total, 2);
+      assert_eq!(s.current_index, Some(0));
+      assert!(!s.no_match);
+    });
+  }
+
+  #[gpui::test]
+  async fn search_next_wraps_to_first_after_last(cx: &mut TestAppContext) {
+    let (view, terminal, cx) = make_search_rig(cx);
+    terminal.write_remote(b"foo bar foo");
+
+    view.update_in(cx, |v, window, cx| v.on_search(&Search, window, cx));
+    set_query(&view, cx, "foo");
+
+    view.update_in(cx, |v, window, cx| {
+      v.on_search_next(&SearchNext, window, cx);
+    });
+    view.read_with(cx, |v, _| {
+      assert_eq!(v.search.as_ref().unwrap().current_index, Some(1));
+    });
+
+    // Past the last match: should wrap to index 0, no_match stays false.
+    view.update_in(cx, |v, window, cx| {
+      v.on_search_next(&SearchNext, window, cx);
+    });
+    view.read_with(cx, |v, _| {
+      let s = v.search.as_ref().unwrap();
+      assert_eq!(s.current_index, Some(0));
+      assert!(!s.no_match);
+    });
+  }
+
+  #[gpui::test]
+  async fn search_prev_wraps_to_last_before_first(cx: &mut TestAppContext) {
+    let (view, terminal, cx) = make_search_rig(cx);
+    terminal.write_remote(b"foo bar foo");
+
+    view.update_in(cx, |v, window, cx| v.on_search(&Search, window, cx));
+    set_query(&view, cx, "foo");
+
+    // Initial = index 0. Prev should wrap to the last (index 1).
+    view.update_in(cx, |v, window, cx| {
+      v.on_search_prev(&SearchPrev, window, cx);
+    });
+    view.read_with(cx, |v, _| {
+      assert_eq!(v.search.as_ref().unwrap().current_index, Some(1));
+    });
+  }
+
+  #[gpui::test]
+  async fn empty_query_resets_search_state(cx: &mut TestAppContext) {
+    let (view, terminal, cx) = make_search_rig(cx);
+    terminal.write_remote(b"foo bar foo");
+
+    view.update_in(cx, |v, window, cx| v.on_search(&Search, window, cx));
+    set_query(&view, cx, "foo");
+    set_query(&view, cx, "");
+
+    view.read_with(cx, |v, _| {
+      let s = v.search.as_ref().unwrap();
+      assert!(s.regex.is_none());
+      assert_eq!(s.total, 0);
+      assert_eq!(s.current_index, None);
+      assert!(!s.no_match, "empty query is not a 'no match' state");
+    });
+  }
+
+  #[gpui::test]
+  async fn no_match_query_flags_no_match(cx: &mut TestAppContext) {
+    let (view, terminal, cx) = make_search_rig(cx);
+    terminal.write_remote(b"foo bar foo");
+
+    view.update_in(cx, |v, window, cx| v.on_search(&Search, window, cx));
+    set_query(&view, cx, "zzz");
+
+    view.read_with(cx, |v, _| {
+      let s = v.search.as_ref().unwrap();
+      assert!(s.no_match);
+      assert_eq!(s.total, 0);
+      assert_eq!(s.current_index, None);
+    });
+  }
+
+  #[gpui::test]
+  async fn mouse_selection_survives_search_dismiss(cx: &mut TestAppContext) {
+    // Regression: search used to overwrite term.selection. The mouse selection
+    // must remain intact after opening and closing the search bar.
+    let (view, terminal, cx) = make_search_rig(cx);
+    terminal.write_remote(b"foo bar foo");
+    terminal.start_selection(
+      SelectionType::Simple,
+      AlacPoint::new(Line(0), Column(0)),
+      Side::Left,
+    );
+    terminal.update_selection(AlacPoint::new(Line(0), Column(2)), Side::Right);
+    assert_eq!(terminal.selection_text(), Some("foo".into()));
+
+    view.update_in(cx, |v, window, cx| v.on_search(&Search, window, cx));
+    set_query(&view, cx, "bar");
+    view.update_in(cx, |v, window, cx| {
+      v.on_search_dismiss(&SearchDismiss, window, cx);
+    });
+
+    assert_eq!(
+      terminal.selection_text(),
+      Some("foo".into()),
+      "mouse selection must survive an unrelated search session"
     );
   }
 }
