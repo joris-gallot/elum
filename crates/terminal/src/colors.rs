@@ -13,6 +13,8 @@ pub struct TerminalTheme {
   pub selection: Rgba,
   /// Background fill for the active Cmd+F match; distinct from `selection`.
   pub search_match: Rgba,
+  /// Foreground forced over search-match cells for contrast against `search_match`.
+  pub search_foreground: Rgba,
   /// 16 ANSI entries: black, red, green, yellow, blue, magenta, cyan, white, then bright variants.
   pub ansi: [Rgba; 16],
 }
@@ -230,8 +232,9 @@ fn one_dark() -> TerminalTheme {
     foreground: rgb(0xe6e6e6),
     background: rgb(0x101418),
     cursor: rgb(0xe6e6e6),
-    selection: rgb(0x3a4d6a),
+    selection: rgb(0x264f78),
     search_match: rgb(0xe5c07b),
+    search_foreground: rgb(0x101418),
     ansi: [
       rgb(0x1f2329), // black
       rgb(0xe06c75), // red
@@ -258,8 +261,9 @@ fn dracula() -> TerminalTheme {
     foreground: rgb(0xf8f8f2),
     background: rgb(0x282a36),
     cursor: rgb(0xf8f8f0),
-    selection: rgb(0x44475a),
+    selection: rgb(0x264f78),
     search_match: rgb(0xffb86c),
+    search_foreground: rgb(0x282a36),
     ansi: [
       rgb(0x21222c),
       rgb(0xff5555),
@@ -286,8 +290,9 @@ fn solarized_dark() -> TerminalTheme {
     foreground: rgb(0x839496),
     background: rgb(0x002b36),
     cursor: rgb(0x93a1a1),
-    selection: rgb(0x073642),
+    selection: rgb(0x264f78),
     search_match: rgb(0xb58900),
+    search_foreground: rgb(0x002b36),
     ansi: [
       rgb(0x073642),
       rgb(0xdc322f),
@@ -314,8 +319,9 @@ fn solarized_light() -> TerminalTheme {
     foreground: rgb(0x657b83),
     background: rgb(0xfdf6e3),
     cursor: rgb(0x586e75),
-    selection: rgb(0xeee8d5),
+    selection: rgb(0xadd6ff),
     search_match: rgb(0xffd479),
+    search_foreground: rgb(0x073642),
     ansi: [
       rgb(0xeee8d5),
       rgb(0xdc322f),
@@ -342,8 +348,9 @@ fn nord() -> TerminalTheme {
     foreground: rgb(0xd8dee9),
     background: rgb(0x2e3440),
     cursor: rgb(0xd8dee9),
-    selection: rgb(0x434c5e),
+    selection: rgb(0x264f78),
     search_match: rgb(0xebcb8b),
+    search_foreground: rgb(0x2e3440),
     ansi: [
       rgb(0x3b4252),
       rgb(0xbf616a),
@@ -370,8 +377,9 @@ fn github_light() -> TerminalTheme {
     foreground: rgb(0x24292e),
     background: rgb(0xffffff),
     cursor: rgb(0x24292e),
-    selection: rgb(0xc8e1ff),
+    selection: rgb(0xadd6ff),
     search_match: rgb(0xfff5b1),
+    search_foreground: rgb(0x24292e),
     ansi: [
       rgb(0x24292e),
       rgb(0xd73a49),
@@ -398,8 +406,9 @@ fn tomorrow_night_bright() -> TerminalTheme {
     foreground: rgb(0xeaeaea),
     background: rgb(0x000000),
     cursor: rgb(0xeaeaea),
-    selection: rgb(0x424242),
+    selection: rgb(0x264f78),
     search_match: rgb(0xe7c547),
+    search_foreground: rgb(0x000000),
     ansi: [
       rgb(0x000000),
       rgb(0xd54e53),

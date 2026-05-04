@@ -11,11 +11,12 @@ use std::sync::Arc;
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
-  fill, point, px, relative, size, App, Bounds, ContentMask, CursorStyle, DispatchPhase, Element,
-  ElementId, FontFallbacks, FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
-  InputHandler, InspectorElementId, IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent,
-  MouseUpEvent, Pixels, Point, Rgba, ScrollWheelEvent, SharedString, Size, StrikethroughStyle,
-  Style, TextAlign, TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity, Window,
+  fill, outline, point, px, relative, size, App, BorderStyle, Bounds, ContentMask, CursorStyle,
+  DispatchPhase, Element, ElementId, FontFallbacks, FontStyle, FontWeight, GlobalElementId, Hitbox,
+  HitboxBehavior, Hsla, InputHandler, InspectorElementId, IntoElement, LayoutId, MouseDownEvent,
+  MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollWheelEvent, SharedString, Size,
+  StrikethroughStyle, Style, TextAlign, TextRun, TextStyle, UTF16Selection, UnderlineStyle,
+  WeakEntity, Window,
 };
 
 use crate::colors::TerminalTheme;
@@ -40,7 +41,8 @@ pub struct TerminalElement {
   view: WeakEntity<TerminalView>,
   focused: bool,
   blink_phase: bool,
-  search_active: bool,
+  search_matches: Vec<alacritty_terminal::selection::SelectionRange>,
+  current_search_match: Option<alacritty_terminal::selection::SelectionRange>,
 }
 
 impl TerminalElement {
@@ -49,14 +51,16 @@ impl TerminalElement {
     view: WeakEntity<TerminalView>,
     focused: bool,
     blink_phase: bool,
-    search_active: bool,
+    search_matches: Vec<alacritty_terminal::selection::SelectionRange>,
+    current_search_match: Option<alacritty_terminal::selection::SelectionRange>,
   ) -> Self {
     Self {
       terminal,
       view,
       focused,
       blink_phase,
-      search_active,
+      search_matches,
+      current_search_match,
     }
   }
 }
@@ -188,14 +192,19 @@ impl Element for TerminalElement {
       cursor: snapshot.cursor,
       cursor_filled: cursor_kind == CursorKind::Filled,
       selection: snapshot.selection,
+      search_matches: &self.search_matches,
+      current_search_match: self.current_search_match,
       display_offset: snapshot.display_offset,
       bg_default: theme.background,
       cursor_bg: theme.cursor,
-      sel_bg: if self.search_active {
-        theme.search_match
-      } else {
-        theme.selection
+      sel_bg: theme.selection,
+      search_bg: theme.search_match,
+      // Dim variant for non-current matches: same hue, half alpha so the cell content shows through.
+      search_bg_dim: Rgba {
+        a: 0.4,
+        ..theme.search_match
       },
+      search_fg: theme.search_foreground,
       theme: &theme,
       text_style: &prepaint.text_style,
     };
@@ -216,6 +225,10 @@ impl Element for TerminalElement {
       if let Some(row) = snapshot.overscan_bottom.as_deref() {
         paint_row_backgrounds(&ctx, n_rows, row, window);
       }
+
+      // Match outlines sit between bg and text so they remain visible even
+      // when a cell is also part of the user's mouse selection.
+      paint_search_outlines(&ctx, n_rows as usize, window);
 
       if let Some(row) = snapshot.overscan_top.as_deref() {
         paint_row_text(&ctx, -1, row, window, cx);
@@ -353,10 +366,15 @@ struct PaintCtx<'a> {
   cursor: (usize, usize),
   cursor_filled: bool,
   selection: Option<alacritty_terminal::selection::SelectionRange>,
+  search_matches: &'a [alacritty_terminal::selection::SelectionRange],
+  current_search_match: Option<alacritty_terminal::selection::SelectionRange>,
   display_offset: usize,
   bg_default: Rgba,
   cursor_bg: Rgba,
   sel_bg: Rgba,
+  search_bg: Rgba,
+  search_bg_dim: Rgba,
+  search_fg: Rgba,
   theme: &'a TerminalTheme,
   text_style: &'a TextStyle,
 }
@@ -495,7 +513,7 @@ fn paint_row_backgrounds(
   for (col, cell) in row.iter().enumerate() {
     let bg = effective_bg(cell, ctx.theme);
     let is_cursor = ctx.cursor_filled && row_for_cursor.is_some_and(|r| ctx.cursor == (r, col));
-    let is_selected = ctx.selection.is_some_and(|range| {
+    let in_range = |range: &alacritty_terminal::selection::SelectionRange| {
       let here = range.contains(AlacPoint::new(grid_line, Column(col)));
       // Wide-char trailing spacers should highlight together with the
       // left half: alacritty's range only covers the left cell, so we
@@ -503,11 +521,18 @@ fn paint_row_backgrounds(
       let spacer_partner =
         cell.wide_spacer && col > 0 && range.contains(AlacPoint::new(grid_line, Column(col - 1)));
       here || spacer_partner
-    });
-    // Selection wins over cursor: the user is highlighting this cell,
-    // not editing at it. Cursor wins over the cell's own bg.
+    };
+    let is_selected = ctx.selection.as_ref().is_some_and(in_range);
+    let is_current_match = !is_selected && ctx.current_search_match.as_ref().is_some_and(in_range);
+    let is_other_match =
+      !is_selected && !is_current_match && ctx.search_matches.iter().any(in_range);
+    // Selection > current match > other match > cursor > cell bg.
     let final_bg = if is_selected {
       ctx.sel_bg
+    } else if is_current_match {
+      ctx.search_bg
+    } else if is_other_match {
+      ctx.search_bg_dim
     } else if is_cursor {
       ctx.cursor_bg
     } else {
@@ -553,6 +578,45 @@ fn flush_bg_run(
   window.paint_quad(fill(bounds, color));
 }
 
+fn paint_search_outlines(ctx: &PaintCtx<'_>, screen_lines: usize, window: &mut Window) {
+  let display_offset = ctx.display_offset as i32;
+  let screen_lines = screen_lines as i32;
+  let outline_color: Hsla = ctx.search_bg.into();
+  let mut paint = |range: &alacritty_terminal::selection::SelectionRange| {
+    let start_line = range.start.line.0;
+    let end_line = range.end.line.0;
+    for grid_line in start_line..=end_line {
+      let visible_row = grid_line + display_offset;
+      if visible_row < 0 || visible_row >= screen_lines {
+        continue;
+      }
+      let col_start = if grid_line == start_line {
+        range.start.column.0
+      } else {
+        0
+      };
+      let col_end = if grid_line == end_line {
+        range.end.column.0
+      } else {
+        // No `cols` field on PaintCtx; only the start row matters for typical inline matches
+        // so multi-line tail rows extending to EOL are clipped by the content mask anyway.
+        col_start.max(range.end.column.0)
+      };
+      let x = ctx.origin.x + ctx.cell_w * col_start as f32;
+      let y = ctx.origin.y + ctx.line_h * visible_row as f32;
+      let w = ctx.cell_w * (col_end - col_start + 1) as f32;
+      let bounds = Bounds::new(point(x, y), size(w, ctx.line_h));
+      window.paint_quad(outline(bounds, outline_color, BorderStyle::Solid));
+    }
+  };
+  for range in ctx.search_matches {
+    paint(range);
+  }
+  if let Some(range) = ctx.current_search_match.as_ref() {
+    paint(range);
+  }
+}
+
 fn paint_row_text(
   ctx: &PaintCtx<'_>,
   row_idx: i32,
@@ -565,6 +629,7 @@ fn paint_row_text(
   } else {
     None
   };
+  let grid_line = Line(row_idx - ctx.display_offset as i32);
 
   // Build the text and runs by coalescing adjacent cells with identical
   // style attributes (fg color + bold + italic + underline).
@@ -580,7 +645,16 @@ fn paint_row_text(
     let glyph_byte_len = glyph_str.len();
 
     let is_cursor = ctx.cursor_filled && row_for_cursor.is_some_and(|r| ctx.cursor == (r, col));
-    let style = row_run_style(cell, is_cursor, ctx.text_style, ctx.theme);
+    let in_range = |range: &alacritty_terminal::selection::SelectionRange| {
+      let here = range.contains(AlacPoint::new(grid_line, Column(col)));
+      let spacer_partner =
+        cell.wide_spacer && col > 0 && range.contains(AlacPoint::new(grid_line, Column(col - 1)));
+      here || spacer_partner
+    };
+    let is_selected = ctx.selection.as_ref().is_some_and(in_range);
+    let is_current_match = !is_selected && ctx.current_search_match.as_ref().is_some_and(in_range);
+    let fg_override = is_current_match.then_some(ctx.search_fg);
+    let style = row_run_style(cell, is_cursor, fg_override, ctx.text_style, ctx.theme);
 
     match &current_style {
       Some(s) if s == &style => {
@@ -674,6 +748,7 @@ const DIM_ALPHA: f32 = 0.7;
 fn row_run_style(
   cell: &CellSnapshot,
   is_cursor: bool,
+  fg_override: Option<Rgba>,
   _base: &TextStyle,
   theme: &TerminalTheme,
 ) -> RowRunStyle {
@@ -686,6 +761,9 @@ fn row_run_style(
   };
   if is_cursor {
     fg = if cell.inverse { cell_fg } else { cell_bg };
+  }
+  if let Some(override_fg) = fg_override {
+    fg = override_fg;
   }
 
   let mut color: Hsla = fg.into();

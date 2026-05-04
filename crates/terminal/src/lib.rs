@@ -221,12 +221,23 @@ impl Terminal {
       .collect()
   }
 
-  /// Highlight `m` as a Simple selection.
-  pub fn set_match_selection(&self, m: &Match) {
-    let mut term = self.term.lock();
-    let mut sel = AlacSelection::new(SelectionType::Simple, *m.start(), Side::Left);
-    sel.update(*m.end(), Side::Right);
-    term.selection = Some(sel);
+  /// Collect matches that overlap the visible viewport. Used to paint live highlights
+  /// without paying the cost of scanning the full scrollback on every frame.
+  pub fn matches_in_viewport(&self, regex: &mut RegexSearch, max: usize) -> Vec<Match> {
+    use alacritty_terminal::term::search::RegexIter;
+    let term = self.term.lock();
+    let display_offset = term.grid().display_offset() as i32;
+    let screen_lines = term.screen_lines() as i32;
+    let bottommost = term.bottommost_line().0;
+    let topmost = term.topmost_line().0;
+    let last_col = term.last_column();
+    let visible_bottom = bottommost - display_offset;
+    let visible_top = (visible_bottom - screen_lines + 1).max(topmost);
+    let start = AlacPoint::new(Line(visible_top), Column(0));
+    let end = AlacPoint::new(Line(visible_bottom), last_col);
+    RegexIter::new(start, end, Direction::Right, &term, regex)
+      .take(max)
+      .collect()
   }
 
   /// Bring `line` into the visible viewport (roughly centered when room allows).
@@ -592,17 +603,5 @@ mod tests {
     let mut re = RegexSearch::new("x").unwrap();
     let all = t.collect_matches(&mut re, 3);
     assert_eq!(all.len(), 3);
-  }
-
-  #[test]
-  fn set_match_selection_paints_match_text() {
-    let t = Terminal::new(GridSize::new(3, 20));
-    t.write_remote(b"foo bar baz");
-    let mut re = RegexSearch::new("bar").unwrap();
-    let m = t
-      .regex_search(&mut re, Point::new(Line(0), Column(0)), Direction::Right)
-      .unwrap();
-    t.set_match_selection(&m);
-    assert_eq!(t.selection_text(), Some("bar".to_string()));
   }
 }

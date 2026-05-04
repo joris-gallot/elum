@@ -344,7 +344,6 @@ impl TerminalView {
 
   fn on_search_dismiss(&mut self, _: &SearchDismiss, window: &mut Window, cx: &mut Context<Self>) {
     if self.search.take().is_some() {
-      self.terminal.clear_selection();
       window.focus(&self.focus, cx);
       cx.notify();
     }
@@ -362,7 +361,6 @@ impl TerminalView {
       state.current_index = None;
       state.total = 0;
       state.total_capped = false;
-      self.terminal.clear_selection();
       cx.notify();
       return;
     }
@@ -373,7 +371,6 @@ impl TerminalView {
       state.no_match = true;
       state.total = 0;
       state.total_capped = false;
-      self.terminal.clear_selection();
       cx.notify();
       return;
     }
@@ -412,7 +409,6 @@ impl TerminalView {
     state.current_index = current_index;
     match result {
       Some(m) => {
-        self.terminal.set_match_selection(&m);
         self.terminal.scroll_to_line(m.start().line);
         state.current = Some(m);
         state.no_match = false;
@@ -903,6 +899,14 @@ fn mouse_cell((row, col): (usize, usize)) -> MouseCell {
   MouseCell::new(row, col)
 }
 
+fn match_to_range(m: &Match) -> alacritty_terminal::selection::SelectionRange {
+  alacritty_terminal::selection::SelectionRange {
+    start: *m.start(),
+    end: *m.end(),
+    is_block: false,
+  }
+}
+
 /// Move one cell forward, wrapping to the next line at end-of-row.
 fn step_after(
   p: alacritty_terminal::index::Point,
@@ -981,7 +985,12 @@ impl Render for TerminalView {
         cx.entity().downgrade(),
         focused,
         blink_phase,
-        self.search.is_some(),
+        self.viewport_search_matches(),
+        self
+          .search
+          .as_ref()
+          .and_then(|s| s.current.as_ref())
+          .map(match_to_range),
       ));
 
     if let Some(state) = &self.search {
@@ -992,7 +1001,25 @@ impl Render for TerminalView {
   }
 }
 
+/// Cap on per-frame viewport match scans; far above any plausible visible count.
+const VIEWPORT_MATCH_LIMIT: usize = 200;
+
 impl TerminalView {
+  fn viewport_search_matches(&mut self) -> Vec<alacritty_terminal::selection::SelectionRange> {
+    let Some(state) = self.search.as_mut() else {
+      return Vec::new();
+    };
+    let Some(regex) = state.regex.as_mut() else {
+      return Vec::new();
+    };
+    self
+      .terminal
+      .matches_in_viewport(regex, VIEWPORT_MATCH_LIMIT)
+      .iter()
+      .map(match_to_range)
+      .collect()
+  }
+
   fn render_search_bar(
     &self,
     state: &SearchState,
@@ -1033,7 +1060,7 @@ impl TerminalView {
           .when_else(
             input_focused,
             |this| this.border_color(theme.ring),
-            |this| this.border_color(gpui::transparent_black()),
+            |this| this.border_color(theme.border),
           )
           .child(Input::new(&state.input).appearance(false).w(px(200.0))),
       );
