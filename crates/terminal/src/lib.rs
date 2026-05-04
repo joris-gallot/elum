@@ -188,8 +188,7 @@ impl Terminal {
     self.with_term(|term| term.colors()[index])
   }
 
-  /// Search for `regex` starting at `origin`. The origin cell is included in
-  /// the candidate range. Bounds are the full scrollback + screen.
+  /// Search `regex` from `origin` to the buffer edge; origin is inclusive.
   pub fn regex_search(
     &self,
     regex: &mut RegexSearch,
@@ -210,9 +209,7 @@ impl Terminal {
     }
   }
 
-  /// Collect up to `max` matches from the start of scrollback to the bottom of
-  /// the live screen, in left-to-right order. Capped to keep counts cheap on
-  /// large buffers; callers can flag over-cap state via the returned length.
+  /// Collect up to `max` matches in left-to-right order; capped so counts stay cheap on huge buffers.
   pub fn collect_matches(&self, regex: &mut RegexSearch, max: usize) -> Vec<Match> {
     use alacritty_terminal::term::search::RegexIter;
     let term = self.term.lock();
@@ -224,7 +221,7 @@ impl Terminal {
       .collect()
   }
 
-  /// Highlight `m` as a Simple selection, used by search-next / search-prev.
+  /// Highlight `m` as a Simple selection.
   pub fn set_match_selection(&self, m: &Match) {
     let mut term = self.term.lock();
     let mut sel = AlacSelection::new(SelectionType::Simple, *m.start(), Side::Left);
@@ -238,8 +235,7 @@ impl Terminal {
     let screen_lines = term.screen_lines() as i32;
     let bottommost = term.bottommost_line().0;
     let history = term.grid().history_size() as i32;
-    // For target line `l`, offset `bottommost - l` puts it on the last visible
-    // row; add half a screen to roughly center it.
+    // Half-screen bias roughly centers the target instead of pinning it to the last row.
     let target_offset = (bottommost - line.0 + screen_lines / 2).clamp(0, history);
     let current = term.grid().display_offset() as i32;
     let delta = target_offset - current;

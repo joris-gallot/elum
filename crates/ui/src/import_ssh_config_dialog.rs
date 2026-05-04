@@ -24,7 +24,6 @@ where
   F: Fn(Vec<usize>, &mut App) + 'static,
 {
   let on_submit = Rc::new(on_submit);
-  // New entries default to checked, existing ones default to unchecked.
   let selected: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(
     rows.iter().map(|r| !r.already_exists).collect(),
   ));

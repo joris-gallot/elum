@@ -40,6 +40,7 @@ pub struct TerminalElement {
   view: WeakEntity<TerminalView>,
   focused: bool,
   blink_phase: bool,
+  search_active: bool,
 }
 
 impl TerminalElement {
@@ -48,12 +49,14 @@ impl TerminalElement {
     view: WeakEntity<TerminalView>,
     focused: bool,
     blink_phase: bool,
+    search_active: bool,
   ) -> Self {
     Self {
       terminal,
       view,
       focused,
       blink_phase,
+      search_active,
     }
   }
 }
@@ -188,7 +191,11 @@ impl Element for TerminalElement {
       display_offset: snapshot.display_offset,
       bg_default: theme.background,
       cursor_bg: theme.cursor,
-      sel_bg: theme.selection,
+      sel_bg: if self.search_active {
+        theme.search_match
+      } else {
+        theme.selection
+      },
       theme: &theme,
       text_style: &prepaint.text_style,
     };

@@ -101,12 +101,10 @@ struct SearchState {
   regex: Option<RegexSearch>,
   current: Option<Match>,
   no_match: bool,
-  /// Index of `current` in the full match list, 0-based. `None` until a match
-  /// is found or after a wrap.
+  /// Index of `current` in the full match list, 0-based.
   current_index: Option<usize>,
-  /// Total matches in buffer, capped at `MAX_MATCH_COUNT`.
+  /// Total matches, capped at `MAX_MATCH_COUNT`.
   total: usize,
-  /// True when the buffer has more than `MAX_MATCH_COUNT` matches.
   total_capped: bool,
   _input_subscription: Subscription,
 }
@@ -228,9 +226,7 @@ impl TerminalView {
   }
 
   fn handle_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, _cx: &mut Context<Self>) {
-    // Bound app shortcuts (Cmd-C/V/A) go through `on_action` and never reach here.
-    // The search input is a descendant of this div, so its keystrokes bubble up;
-    // skip the PTY relay unless focus is directly on the terminal.
+    // Search-input keystrokes bubble up to this div; only relay when terminal owns focus.
     if !self.focus.is_focused(window) {
       return;
     }
@@ -267,18 +263,41 @@ impl TerminalView {
   }
 
   fn on_search(&mut self, _: &Search, window: &mut Window, cx: &mut Context<Self>) {
+    // Seed from a single-line selection only; multi-line text rarely matches as a query.
+    let seed = self
+      .terminal
+      .selection_text()
+      .filter(|s| !s.is_empty() && !s.contains('\n'));
+
     if let Some(state) = &self.search {
-      let handle = state.input.read(cx).focus_handle(cx);
+      let input = state.input.clone();
+      let handle = input.read(cx).focus_handle(cx);
       window.focus(&handle, cx);
+      // Identical seed = the highlight is the search match, not a fresh user selection.
+      if let Some(seed) = seed {
+        let current = input.read(cx).value().to_string();
+        if seed != current {
+          input.update(cx, |state, cx| state.set_value(seed, window, cx));
+          self.on_search_text_changed(cx);
+        }
+      }
       return;
     }
-
-    let input = cx.new(|cx| InputState::new(window, cx).placeholder("Find"));
+    let input = cx.new(|cx| {
+      let s = InputState::new(window, cx).placeholder("Find");
+      if let Some(seed) = seed.clone() {
+        s.default_value(seed)
+      } else {
+        s
+      }
+    });
     let sub = cx.subscribe(&input, |this, _, ev: &InputEvent, cx| match ev {
       InputEvent::Change => this.on_search_text_changed(cx),
       InputEvent::PressEnter { .. } => this.search_step(Direction::Right, cx),
       InputEvent::Focus | InputEvent::Blur => cx.notify(),
     });
+    // The seed text didn't go through Change, so trigger a search manually.
+    let needs_initial_search = seed.is_some();
     let handle = input.read(cx).focus_handle(cx);
     self.search = Some(SearchState {
       input,
@@ -291,6 +310,9 @@ impl TerminalView {
       _input_subscription: sub,
     });
     window.focus(&handle, cx);
+    if needs_initial_search {
+      self.on_search_text_changed(cx);
+    }
     cx.notify();
   }
 
@@ -337,9 +359,8 @@ impl TerminalView {
       cx.notify();
       return;
     }
-    // Anchor the first search at the bottom of the viewport so the freshest
-    // matches surface first; the user can press Cmd+Shift+G to walk older ones.
-    self.search_step(Direction::Left, cx);
+    // Start at the top so "1 of N" is the first match in reading order.
+    self.search_step(Direction::Right, cx);
   }
 
   fn search_step(&mut self, direction: Direction, cx: &mut Context<Self>) {
@@ -357,8 +378,6 @@ impl TerminalView {
       result = self.terminal.regex_search(&mut regex, wrap, direction);
     }
 
-    // Refresh the cached total + index whenever we step. Cheap on small
-    // buffers; capped at MAX_MATCH_COUNT for large ones.
     let all = self
       .terminal
       .collect_matches(&mut regex, MAX_MATCH_COUNT + 1);
@@ -408,8 +427,6 @@ impl TerminalView {
       (Some(m), Direction::Left) => {
         step_before(*m.start(), cols).unwrap_or_else(|| AlacPoint::new(Line(0), Column(0)))
       }
-      // Initial search: anchor at the bottom of the live screen, scanning
-      // backwards into scrollback (Direction::Left).
       (None, Direction::Left) => AlacPoint::new(self.bottommost_line(), last_col),
       (None, Direction::Right) => AlacPoint::new(self.topmost_line(), Column(0)),
     }
@@ -944,6 +961,7 @@ impl Render for TerminalView {
         cx.entity().downgrade(),
         focused,
         blink_phase,
+        self.search.is_some(),
       ));
 
     if let Some(state) = &self.search {
