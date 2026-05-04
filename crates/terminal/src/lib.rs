@@ -240,15 +240,25 @@ impl Terminal {
       .collect()
   }
 
-  /// Bring `line` into the visible viewport (roughly centered when room allows).
+  /// Bring `line` into view, centered. No-op if it's already comfortably visible
+  /// (i.e. not within `padding` rows of a viewport edge).
   pub fn scroll_to_line(&self, line: Line) {
     let mut term = self.term.lock();
     let screen_lines = term.screen_lines() as i32;
     let bottommost = term.bottommost_line().0;
     let history = term.grid().history_size() as i32;
-    // Half-screen bias roughly centers the target instead of pinning it to the last row.
-    let target_offset = (bottommost - line.0 + screen_lines / 2).clamp(0, history);
     let current = term.grid().display_offset() as i32;
+    let visible_top = bottommost - current - screen_lines + 1;
+    let visible_bottom = bottommost - current;
+
+    // Edge padding: avoid scrolling for a one-line wiggle, and keep the match away from the rim.
+    let padding = (screen_lines / 6).max(2);
+    let line_n = line.0;
+    if line_n >= visible_top + padding && line_n <= visible_bottom - padding {
+      return;
+    }
+
+    let target_offset = (bottommost - line_n - screen_lines / 2 + 1).clamp(0, history);
     let delta = target_offset - current;
     if delta != 0 {
       term.scroll_display(Scroll::Delta(delta));
