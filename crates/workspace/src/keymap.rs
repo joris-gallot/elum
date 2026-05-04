@@ -6,8 +6,8 @@ use crate::workspace::{self, KEY_CONTEXT as WORKSPACE_CONTEXT, PAGE_KEY_CONTEXT 
 use terminal::view::{
   Copy as TerminalCopy, Paste as TerminalPaste, Search as TerminalSearch,
   SearchDismiss as TerminalSearchDismiss, SearchNext as TerminalSearchNext,
-  SearchPrev as TerminalSearchPrev, SelectAll as TerminalSelectAll,
-  KEY_CONTEXT as TERMINAL_CONTEXT,
+  SearchPrev as TerminalSearchPrev, SelectAll as TerminalSelectAll, ShiftTab as TerminalShiftTab,
+  Tab as TerminalTab, KEY_CONTEXT as TERMINAL_CONTEXT,
 };
 
 pub fn install(cx: &mut App) {
@@ -20,6 +20,9 @@ pub fn install(cx: &mut App) {
     KeyBinding::new("cmd-g", TerminalSearchNext, Some(TERMINAL_CONTEXT)),
     KeyBinding::new("cmd-shift-g", TerminalSearchPrev, Some(TERMINAL_CONTEXT)),
     KeyBinding::new("escape", TerminalSearchDismiss, Some(TERMINAL_CONTEXT)),
+    // Override gpui-component's Root tab/shift-tab focus traversal so they reach the PTY.
+    KeyBinding::new("tab", TerminalTab, Some(TERMINAL_CONTEXT)),
+    KeyBinding::new("shift-tab", TerminalShiftTab, Some(TERMINAL_CONTEXT)),
     // Workspace-scoped: fires from anywhere in the workspace
     KeyBinding::new("cmd-w", workspace::CloseTab, Some(WORKSPACE_CONTEXT)),
     KeyBinding::new("cmd-shift-]", workspace::NextTab, Some(WORKSPACE_CONTEXT)),

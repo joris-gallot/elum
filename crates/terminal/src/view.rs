@@ -38,6 +38,8 @@ actions!(
     SearchNext,
     SearchPrev,
     SearchDismiss,
+    Tab,
+    ShiftTab,
   ]
 );
 
@@ -260,6 +262,22 @@ impl TerminalView {
 
   fn on_select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
     self.select_all(cx);
+  }
+
+  fn on_tab(&mut self, _: &Tab, _window: &mut Window, cx: &mut Context<Self>) {
+    self.send_pty(b"\x09".to_vec());
+    cx.stop_propagation();
+  }
+
+  fn on_shift_tab(&mut self, _: &ShiftTab, _window: &mut Window, cx: &mut Context<Self>) {
+    self.send_pty(b"\x1b[Z".to_vec());
+    cx.stop_propagation();
+  }
+
+  fn send_pty(&self, bytes: Vec<u8>) {
+    self.terminal.scroll_to_bottom();
+    self.terminal.clear_selection();
+    let _ = self.to_remote.send(bytes);
   }
 
   fn on_search(&mut self, _: &Search, window: &mut Window, cx: &mut Context<Self>) {
@@ -948,6 +966,8 @@ impl Render for TerminalView {
       .on_action(cx.listener(Self::on_search_next))
       .on_action(cx.listener(Self::on_search_prev))
       .on_action(cx.listener(Self::on_search_dismiss))
+      .on_action(cx.listener(Self::on_tab))
+      .on_action(cx.listener(Self::on_shift_tab))
       .on_key_down(cx.listener(Self::handle_key_down))
       .size_full()
       .relative()
