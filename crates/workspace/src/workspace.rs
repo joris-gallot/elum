@@ -94,9 +94,9 @@ pub struct ImportSshConfig;
 /// Key context for app-level bindings
 pub const KEY_CONTEXT: &str = "Workspace";
 
-const SIDEBAR_DEFAULT_WIDTH: f32 = 230.0;
-const SIDEBAR_MIN_WIDTH: f32 = 200.0;
-const SIDEBAR_MAX_WIDTH: f32 = 400.0;
+const SIDEBAR_DEFAULT_WIDTH: f32 = 250.0;
+const SIDEBAR_MIN_WIDTH: f32 = 230.0;
+const SIDEBAR_MAX_WIDTH: f32 = 450.0;
 const TAB_BAR_HEIGHT_PX: f32 = 30.0;
 
 const INITIAL_COLS: u16 = 80;
