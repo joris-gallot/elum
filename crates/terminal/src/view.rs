@@ -1509,7 +1509,7 @@ mod view_tests {
   fn make_search_rig(
     cx: &mut TestAppContext,
   ) -> (Entity<TerminalView>, Arc<Terminal>, &mut VisualTestContext) {
-    cx.update(|cx| gpui_component::init(cx));
+    cx.update(gpui_component::init);
     let terminal = Arc::new(Terminal::new(GridSize::new(24, 80)));
     let (_from_remote_tx, from_remote_rx) = flume::unbounded::<Vec<u8>>();
     let (to_remote_tx, _to_remote_rx) = flume::unbounded::<Vec<u8>>();
