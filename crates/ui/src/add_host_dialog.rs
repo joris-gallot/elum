@@ -73,9 +73,12 @@ pub fn open<F>(
     NewAuth::Password { .. } => None,
   });
 
-  // Index 0 = "none"; subsequent indices map to `jump_hosts[i-1]`.
+  // Index 0 = sentinel "none"; subsequent indices map to `jump_host_names[i-1]`.
+  // The sentinel string is purely cosmetic; selection is read by index so a
+  // user host literally named "none" is unambiguous.
+  let jump_host_names: Vec<String> = jump_hosts.iter().map(|h| h.name.clone()).collect();
   let jump_options: Vec<String> = std::iter::once("none".to_string())
-    .chain(jump_hosts.iter().map(|h| h.name.clone()))
+    .chain(jump_host_names.iter().cloned())
     .collect();
   let initial_jump_index = initial
     .as_ref()
@@ -154,6 +157,7 @@ pub fn open<F>(
     let password = password.clone();
     let mode = mode.clone();
     let jump_state = jump_state.clone();
+    let jump_host_names = jump_host_names.clone();
     let on_submit = on_submit.clone();
 
     let auth_tabs = TabBar::new("auth-mode")
@@ -281,13 +285,12 @@ pub fn open<F>(
           }
         };
 
-        let proxy_jump = jump_state.read(cx).selected_value().and_then(|v| {
-          if v.as_str() == "none" {
-            None
-          } else {
-            Some(v.clone())
-          }
-        });
+        let proxy_jump = jump_state
+          .read(cx)
+          .selected_index(cx)
+          .map(|ix| ix.row)
+          .filter(|row| *row > 0)
+          .and_then(|row| jump_host_names.get(row - 1).cloned());
 
         let input = NewHostInput {
           name: name_v,
