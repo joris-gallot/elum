@@ -1294,7 +1294,7 @@ mod tests {
   fn single_jump_orders_root_first_leaf_last() {
     let bastion = host("b", "bastion", None);
     let leaf = host("c", "target", Some("bastion"));
-    let hosts = vec![bastion.clone(), leaf.clone()];
+    let hosts = vec![bastion, leaf.clone()];
     let chain = build_connect_chain(&hosts, &leaf, dummy_auth(), always_ok).unwrap();
     let ids: Vec<&str> = chain.iter().map(|(h, _)| h.id.as_str()).collect();
     assert_eq!(ids, vec!["b", "c"]);
