@@ -26,6 +26,7 @@ RUN printf '%s\n' \
     'AllowUsers testuser' \
     'AcceptEnv LANG LC_*' \
     'PrintMotd no' \
+    'AllowTcpForwarding yes' \
     > /etc/ssh/sshd_config.d/elum.conf
 
 EXPOSE 22

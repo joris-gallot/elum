@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,7 +28,7 @@ use tokio::runtime::Runtime;
 use crate::host_book::{Host, HostAuth, HostBook};
 use crate::keychain;
 use crate::ssh_config_import;
-use ui::add_host_dialog::{self, NewAuth, NewHostInput};
+use ui::add_host_dialog::{self, JumpHostOption, NewAuth, NewHostInput};
 use ui::host_key_dialog::{self, HostKeyDialogInfo, HostKeyDialogKind, HostKeyDialogVerdict};
 use ui::import_ssh_config_dialog::{self, ImportRow};
 use ui::secret_prompt::{self, SecretPrompt};
@@ -334,22 +335,41 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
+    let chain = match self.build_connect_chain(&host, auth.clone()) {
+      Ok(chain) => chain,
+      Err(msg) => {
+        self.finalize_tab(tab_id, Err(msg), window, cx);
+        return;
+      }
+    };
+
     let runtime = self.runtime.clone();
     let host_key_policy = Arc::new(WorkspaceHostKeyPolicy {
       requests: self.host_key_requests.clone(),
     });
     cx.spawn_in(window, async move |this, cx| {
-      let host_for_task = host.clone();
-      let auth_for_task = auth.clone();
+      let chain_for_task = chain.clone();
       let join = runtime.spawn(async move {
+        let mut iter = chain_for_task.into_iter();
+        let (root_host, root_auth) = iter.next().expect("chain non-empty");
         let cfg = ConnectConfig::new(
-          &host_for_task.host,
-          host_for_task.port,
-          &host_for_task.user,
-          auth_for_task,
-          host_key_policy,
+          &root_host.host,
+          root_host.port,
+          &root_host.user,
+          root_auth,
+          host_key_policy.clone(),
         );
-        let session = Session::connect(&cfg).await?;
+        let mut session = Session::connect(&cfg).await?;
+        for (hop_host, hop_auth) in iter {
+          let cfg = ConnectConfig::new(
+            &hop_host.host,
+            hop_host.port,
+            &hop_host.user,
+            hop_auth,
+            host_key_policy.clone(),
+          );
+          session = Session::connect_via(session, &cfg).await?;
+        }
         let shell = session.open_shell(INITIAL_COLS, INITIAL_ROWS).await?;
         Ok::<ShellHandle, anyhow::Error>(shell)
       });
@@ -423,6 +443,16 @@ impl Workspace {
       }
     })
     .detach();
+  }
+
+  fn build_connect_chain(
+    &self,
+    leaf: &Host,
+    leaf_auth: AuthMethod,
+  ) -> std::result::Result<Vec<(Host, AuthMethod)>, String> {
+    build_connect_chain(self.host_book.hosts(), leaf, leaf_auth, |host| {
+      resolve_non_interactive_auth(host)
+    })
   }
 
   fn mark_passphrase_saved(&mut self, host_id: &str) {
@@ -620,6 +650,7 @@ impl Workspace {
       port: input.port,
       user: input.user,
       auth,
+      proxy_jump: input.proxy_jump,
     };
     self.host_book.add(host);
     self.persist_host_book();
@@ -645,6 +676,7 @@ impl Workspace {
       port: input.port,
       user: input.user,
       auth,
+      proxy_jump: input.proxy_jump,
     };
     self.host_book.replace(idx, host);
     self.persist_host_book();
@@ -688,14 +720,28 @@ impl Workspace {
       port: host.port,
       user: host.user.clone(),
       auth,
+      proxy_jump: host.proxy_jump.clone(),
     };
     let view = cx.entity().downgrade();
-    add_host_dialog::open(window, cx, Some(initial), move |input, cx| {
+    let jump_options = self.jump_host_options(Some(&host_id));
+    add_host_dialog::open(window, cx, Some(initial), jump_options, move |input, cx| {
       let host_id = host_id.clone();
       let _ = view.update(cx, |this, cx| {
         this.replace_host_from_dialog(&host_id, input, cx);
       });
     });
+  }
+
+  fn jump_host_options(&self, exclude_id: Option<&str>) -> Vec<JumpHostOption> {
+    self
+      .host_book
+      .hosts()
+      .iter()
+      .filter(|h| exclude_id.is_none_or(|id| h.id != id))
+      .map(|h| JumpHostOption {
+        name: h.name.clone(),
+      })
+      .collect()
   }
 
   fn on_delete_host(&mut self, action: &DeleteHost, window: &mut Window, cx: &mut Context<Self>) {
@@ -806,9 +852,11 @@ impl Workspace {
       .label("Add host")
       .on_click({
         let view = view.clone();
+        let jump_options = self.jump_host_options(None);
         move |_, window, cx| {
           let view = view.clone();
-          add_host_dialog::open(window, cx, None, move |input, cx| {
+          let jump_options = jump_options.clone();
+          add_host_dialog::open(window, cx, None, jump_options, move |input, cx| {
             let _ = view.update(cx, |app, cx| {
               app.add_host_from_dialog(input, cx);
             });
@@ -1089,6 +1137,68 @@ fn is_encrypted_key_error(err: &anyhow::Error) -> bool {
     .any(|cause| cause.to_string().contains("The key is encrypted"))
 }
 
+/// Walk the ProxyJump chain rooted at `leaf` and return hops in
+/// connection order (root first, leaf last). Non-leaf hops resolve their
+/// auth via `parent_auth`; returns user-facing error strings on cycles,
+/// missing parents, or parents needing UI prompts.
+fn build_connect_chain<F>(
+  hosts: &[Host],
+  leaf: &Host,
+  leaf_auth: AuthMethod,
+  parent_auth: F,
+) -> std::result::Result<Vec<(Host, AuthMethod)>, String>
+where
+  F: Fn(&Host) -> Option<AuthMethod>,
+{
+  let mut chain: Vec<(Host, AuthMethod)> = vec![(leaf.clone(), leaf_auth)];
+  let mut visited: HashSet<String> = HashSet::new();
+  visited.insert(leaf.id.clone());
+
+  while let Some(parent_name) = chain.last().unwrap().0.proxy_jump.clone() {
+    let parent = hosts
+      .iter()
+      .find(|h| h.name.eq_ignore_ascii_case(&parent_name))
+      .ok_or_else(|| format!("ProxyJump host `{parent_name}` not found in host book"))?;
+    if !visited.insert(parent.id.clone()) {
+      return Err(format!("ProxyJump cycle detected at `{}`", parent.name));
+    }
+    let auth = parent_auth(parent).ok_or_else(|| {
+      format!(
+        "ProxyJump host `{}` needs interactive auth (save passphrase or password in keychain first)",
+        parent.name
+      )
+    })?;
+    chain.push((parent.clone(), auth));
+  }
+
+  chain.reverse();
+  Ok(chain)
+}
+
+/// Returns an auth method for `host` if it can be resolved without prompting:
+/// unencrypted public keys, or secrets already stored in the OS keychain.
+fn resolve_non_interactive_auth(host: &Host) -> Option<AuthMethod> {
+  match &host.auth {
+    HostAuth::PublicKey {
+      key_path,
+      passphrase_in_keychain,
+    } => {
+      let passphrase = if *passphrase_in_keychain {
+        Some(keychain::fetch(&host.id, keychain::PASSPHRASE)?)
+      } else {
+        None
+      };
+      Some(AuthMethod::PublicKey {
+        key_path: key_path.clone(),
+        passphrase,
+      })
+    }
+    HostAuth::Password { in_keychain: true } => keychain::fetch(&host.id, keychain::PASSWORD)
+      .map(|password| AuthMethod::Password { password }),
+    HostAuth::Password { in_keychain: false } => None,
+  }
+}
+
 /// Persists fresh secrets to keychain; preserves the previous `*_in_keychain` flag otherwise.
 fn build_host_auth(host_id: &str, input: NewAuth, previous: &HostAuth) -> HostAuth {
   match input {
@@ -1143,4 +1253,111 @@ fn generate_host_id() -> String {
     .duration_since(UNIX_EPOCH)
     .map_or(0, |d| d.as_millis());
   format!("host-{ms}")
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::path::PathBuf;
+
+  fn host(id: &str, name: &str, proxy_jump: Option<&str>) -> Host {
+    Host {
+      id: id.into(),
+      name: name.into(),
+      host: format!("{name}.example.com"),
+      port: 22,
+      user: "u".into(),
+      auth: HostAuth::PublicKey {
+        key_path: PathBuf::from("/tmp/k"),
+        passphrase_in_keychain: false,
+      },
+      proxy_jump: proxy_jump.map(String::from),
+    }
+  }
+
+  fn dummy_auth() -> AuthMethod {
+    AuthMethod::PublicKey {
+      key_path: PathBuf::from("/tmp/k"),
+      passphrase: None,
+    }
+  }
+
+  fn always_ok(_: &Host) -> Option<AuthMethod> {
+    Some(dummy_auth())
+  }
+
+  #[test]
+  fn direct_connection_yields_single_hop() {
+    let leaf = host("a", "alpha", None);
+    let hosts = vec![leaf.clone()];
+    let chain = build_connect_chain(&hosts, &leaf, dummy_auth(), always_ok).unwrap();
+    assert_eq!(chain.len(), 1);
+    assert_eq!(chain[0].0.id, "a");
+  }
+
+  #[test]
+  fn single_jump_orders_root_first_leaf_last() {
+    let bastion = host("b", "bastion", None);
+    let leaf = host("c", "target", Some("bastion"));
+    let hosts = vec![bastion.clone(), leaf.clone()];
+    let chain = build_connect_chain(&hosts, &leaf, dummy_auth(), always_ok).unwrap();
+    let ids: Vec<&str> = chain.iter().map(|(h, _)| h.id.as_str()).collect();
+    assert_eq!(ids, vec!["b", "c"]);
+  }
+
+  #[test]
+  fn multi_hop_chain_resolves_in_root_to_leaf_order() {
+    let root = host("r", "root", None);
+    let mid = host("m", "mid", Some("root"));
+    let leaf = host("l", "leaf", Some("mid"));
+    let hosts = vec![root, mid, leaf.clone()];
+    let chain = build_connect_chain(&hosts, &leaf, dummy_auth(), always_ok).unwrap();
+    let ids: Vec<&str> = chain.iter().map(|(h, _)| h.id.as_str()).collect();
+    assert_eq!(ids, vec!["r", "m", "l"]);
+  }
+
+  #[test]
+  fn jump_host_lookup_is_case_insensitive() {
+    let bastion = host("b", "Bastion", None);
+    let leaf = host("c", "target", Some("BASTION"));
+    let hosts = vec![bastion, leaf.clone()];
+    let chain = build_connect_chain(&hosts, &leaf, dummy_auth(), always_ok).unwrap();
+    assert_eq!(chain.len(), 2);
+  }
+
+  #[test]
+  fn missing_jump_host_returns_friendly_error() {
+    let leaf = host("c", "target", Some("ghost"));
+    let hosts = vec![leaf.clone()];
+    let err = build_connect_chain(&hosts, &leaf, dummy_auth(), always_ok).unwrap_err();
+    assert!(err.contains("ghost"));
+    assert!(err.contains("not found"));
+  }
+
+  #[test]
+  fn cycle_is_detected() {
+    let a = host("a", "alpha", Some("beta"));
+    let b = host("b", "beta", Some("alpha"));
+    let hosts = vec![a.clone(), b];
+    let err = build_connect_chain(&hosts, &a, dummy_auth(), always_ok).unwrap_err();
+    assert!(err.contains("cycle"));
+  }
+
+  #[test]
+  fn self_referential_jump_is_detected_as_cycle() {
+    let a = host("a", "alpha", Some("alpha"));
+    let hosts = vec![a.clone()];
+    let err = build_connect_chain(&hosts, &a, dummy_auth(), always_ok).unwrap_err();
+    assert!(err.contains("cycle"));
+  }
+
+  #[test]
+  fn parent_without_resolvable_auth_returns_friendly_error() {
+    let bastion = host("b", "bastion", None);
+    let leaf = host("c", "target", Some("bastion"));
+    let hosts = vec![bastion, leaf.clone()];
+    let err = build_connect_chain(&hosts, &leaf, dummy_auth(), |_| None).unwrap_err();
+    assert!(err.contains("bastion"));
+    assert!(err.contains("interactive"));
+  }
 }

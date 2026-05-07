@@ -128,5 +128,6 @@ fn default_docker_host() -> Host {
       key_path,
       passphrase_in_keychain: false,
     },
+    proxy_jump: None,
   }
 }

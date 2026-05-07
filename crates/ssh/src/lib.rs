@@ -203,23 +203,62 @@ pub struct ExecOutput {
 /// issue commands on it; drop or `close()` it when done.
 pub struct Session {
   handle: Handle<ClientHandler>,
+  /// Tunnel chain kept alive for the lifetime of this session.
+  /// Innermost-first: `parents[0]` is this session's direct ProxyJump host.
+  parents: Vec<Session>,
 }
 
 impl Session {
   /// Open a TCP+SSH connection and authenticate using the configured method.
   pub async fn connect(cfg: &ConnectConfig) -> Result<Self> {
     let config = Arc::new(client::Config::default());
-    let handler = ClientHandler {
+    let handler = Self::build_handler(cfg);
+
+    let handle = client::connect(config, (cfg.host.as_str(), cfg.port), handler)
+      .await
+      .with_context(|| format!("connecting to {}:{}", cfg.host, cfg.port))?;
+
+    Self::finish_handshake(handle, cfg, Vec::new()).await
+  }
+
+  /// Open an SSH session tunneled through `parent` (ProxyJump). The parent
+  /// keeps its transport alive for as long as the returned session lives.
+  pub async fn connect_via(parent: Session, cfg: &ConnectConfig) -> Result<Self> {
+    let channel = parent
+      .handle
+      .channel_open_direct_tcpip(cfg.host.clone(), u32::from(cfg.port), "", 0)
+      .await
+      .with_context(|| {
+        format!(
+          "opening direct-tcpip to {}:{} via jump host",
+          cfg.host, cfg.port
+        )
+      })?;
+    let stream = channel.into_stream();
+
+    let config = Arc::new(client::Config::default());
+    let handler = Self::build_handler(cfg);
+    let handle = client::connect_stream(config, stream, handler)
+      .await
+      .with_context(|| format!("ssh handshake to {}:{} via jump host", cfg.host, cfg.port))?;
+
+    Self::finish_handshake(handle, cfg, vec![parent]).await
+  }
+
+  fn build_handler(cfg: &ConnectConfig) -> ClientHandler {
+    ClientHandler {
       host: cfg.host.clone(),
       port: cfg.port,
       policy: cfg.host_key_policy.clone(),
       known_hosts_path: cfg.known_hosts_path.clone(),
-    };
+    }
+  }
 
-    let mut handle = client::connect(config, (cfg.host.as_str(), cfg.port), handler)
-      .await
-      .with_context(|| format!("connecting to {}:{}", cfg.host, cfg.port))?;
-
+  async fn finish_handshake(
+    mut handle: Handle<ClientHandler>,
+    cfg: &ConnectConfig,
+    parents: Vec<Session>,
+  ) -> Result<Self> {
     let auth = match &cfg.auth {
       AuthMethod::PublicKey {
         key_path,
@@ -248,7 +287,7 @@ impl Session {
       return Err(anyhow!("authentication rejected for user `{}`", cfg.user));
     }
 
-    Ok(Self { handle })
+    Ok(Self { handle, parents })
   }
 
   /// Execute a single non-interactive command and collect all output. The
@@ -319,10 +358,12 @@ impl Session {
     let (to_remote_tx, to_remote_rx) = flume::unbounded::<Vec<u8>>();
     let (resize_tx, resize_rx) = flume::unbounded::<(u16, u16)>();
 
-    // Move the session handle into the relay task so the SSH transport
-    // stays alive for as long as the shell is in use.
+    // Move both the session handle and any tunneling parents into the relay
+    // task so the entire SSH chain stays alive for as long as the shell is
+    // in use.
     let task = tokio::spawn(relay_loop(
       self.handle,
+      self.parents,
       channel,
       from_remote_tx,
       to_remote_rx,
@@ -343,6 +384,7 @@ impl Session {
 /// SSH operation errors.
 async fn relay_loop(
   _handle: Handle<ClientHandler>,
+  _parents: Vec<Session>,
   mut channel: russh::Channel<russh::client::Msg>,
   from_remote: flume::Sender<Vec<u8>>,
   to_remote: flume::Receiver<Vec<u8>>,

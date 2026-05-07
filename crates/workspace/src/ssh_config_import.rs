@@ -14,6 +14,7 @@ pub struct ImportCandidate {
   pub port: u16,
   pub user: String,
   pub identity_file: Option<PathBuf>,
+  pub proxy_jump: Option<String>,
   pub already_exists: bool,
   pub warnings: Vec<String>,
 }
@@ -79,9 +80,12 @@ fn build_candidate(config: &SshConfig, alias: &str, existing: &HostBook) -> Impo
     .map(expand_tilde);
 
   let mut warnings = Vec::new();
-  if params.proxy_jump.is_some() {
-    warnings.push("ProxyJump not supported yet".into());
-  }
+  let proxy_jump = params.proxy_jump.as_ref().and_then(|chain| {
+    if chain.len() > 1 {
+      warnings.push("ProxyJump chain truncated to first host".into());
+    }
+    chain.first().cloned()
+  });
 
   let already_exists = existing.hosts().iter().any(|h| {
     h.name.eq_ignore_ascii_case(alias) || (h.host == host && h.port == port && h.user == user)
@@ -93,6 +97,7 @@ fn build_candidate(config: &SshConfig, alias: &str, existing: &HostBook) -> Impo
     port,
     user,
     identity_file,
+    proxy_jump,
     already_exists,
     warnings,
   }
@@ -123,6 +128,7 @@ pub fn candidate_to_host(id: String, c: &ImportCandidate) -> Host {
     port: c.port,
     user: c.user.clone(),
     auth,
+    proxy_jump: c.proxy_jump.clone(),
   }
 }
 
@@ -215,20 +221,21 @@ mod tests {
       port: 22,
       user: "irrelevant".into(),
       auth: HostAuth::Password { in_keychain: false },
+      proxy_jump: None,
     });
     let cands = parse_ssh_config(&path, &book).unwrap();
     assert!(cands[0].already_exists);
   }
 
   #[test]
-  fn proxy_jump_is_warned_about() {
+  fn proxy_jump_is_propagated() {
     let dir = TempDir::new().unwrap();
     let path = write_config(
       &dir,
       "Host behind\n  HostName 10.0.0.1\n  User u\n  ProxyJump bastion\n",
     );
     let cands = parse_ssh_config(&path, &empty_book(&dir)).unwrap();
-    assert_eq!(cands[0].warnings.len(), 1);
-    assert!(cands[0].warnings[0].contains("ProxyJump"));
+    assert!(cands[0].warnings.is_empty());
+    assert_eq!(cands[0].proxy_jump.as_deref(), Some("bastion"));
   }
 }

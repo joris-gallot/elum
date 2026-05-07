@@ -2,14 +2,15 @@ use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use gpui::{px, App, AppContext, Entity, ParentElement, Styled, Window};
+use gpui::{px, App, AppContext, Entity, IntoElement, ParentElement, Styled, Window};
 use gpui_component::{
   button::{Button, ButtonVariants as _},
   dialog::{CancelDialog, ConfirmDialog, DialogFooter},
   form::{field, v_form},
   input::{Input, InputState},
+  select::{Select, SelectState},
   tab::{Tab, TabBar},
-  WindowExt as _,
+  IndexPath, WindowExt as _,
 };
 
 #[derive(Debug, Clone)]
@@ -30,13 +31,25 @@ pub struct NewHostInput {
   pub port: u16,
   pub user: String,
   pub auth: NewAuth,
+  /// Name of another host to tunnel through (ProxyJump). `None` = direct.
+  pub proxy_jump: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JumpHostOption {
+  pub name: String,
 }
 
 const MODE_KEY: usize = 0;
 const MODE_PASSWORD: usize = 1;
 
-pub fn open<F>(window: &mut Window, cx: &mut App, initial: Option<NewHostInput>, on_submit: F)
-where
+pub fn open<F>(
+  window: &mut Window,
+  cx: &mut App,
+  initial: Option<NewHostInput>,
+  jump_hosts: Vec<JumpHostOption>,
+  on_submit: F,
+) where
   F: Fn(NewHostInput, &mut App) + 'static,
 {
   let on_submit = Rc::new(on_submit);
@@ -58,6 +71,29 @@ where
   let key_default = initial.as_ref().and_then(|i| match &i.auth {
     NewAuth::PublicKey { key_path, .. } => Some(key_path.to_string_lossy().to_string()),
     NewAuth::Password { .. } => None,
+  });
+
+  // Index 0 = "none"; subsequent indices map to `jump_hosts[i-1]`.
+  let jump_options: Vec<String> = std::iter::once("none".to_string())
+    .chain(jump_hosts.iter().map(|h| h.name.clone()))
+    .collect();
+  let initial_jump_index = initial
+    .as_ref()
+    .and_then(|i| i.proxy_jump.as_deref())
+    .and_then(|name| {
+      jump_hosts
+        .iter()
+        .position(|h| h.name.eq_ignore_ascii_case(name))
+        .map(|p| p + 1)
+    })
+    .unwrap_or(0);
+  let jump_state = cx.new(|cx| {
+    SelectState::new(
+      jump_options,
+      Some(IndexPath::new(initial_jump_index)),
+      window,
+      cx,
+    )
   });
 
   let mode = Rc::new(Cell::new(initial_mode));
@@ -117,6 +153,7 @@ where
     let passphrase = passphrase.clone();
     let password = password.clone();
     let mode = mode.clone();
+    let jump_state = jump_state.clone();
     let on_submit = on_submit.clone();
 
     let auth_tabs = TabBar::new("auth-mode")
@@ -181,6 +218,12 @@ where
         );
     }
 
+    form = form.child(
+      field()
+        .label("Via (jump host)")
+        .child(Select::new(&jump_state).into_element()),
+    );
+
     dialog
       .w(px(440.))
       .overlay_closable(false)
@@ -238,12 +281,21 @@ where
           }
         };
 
+        let proxy_jump = jump_state.read(cx).selected_value().and_then(|v| {
+          if v.as_str() == "none" {
+            None
+          } else {
+            Some(v.clone())
+          }
+        });
+
         let input = NewHostInput {
           name: name_v,
           host: host_v,
           port: port_v,
           user: user_v,
           auth,
+          proxy_jump,
         };
         on_submit(input, cx);
         true
