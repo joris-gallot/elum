@@ -203,8 +203,7 @@ pub struct ExecOutput {
 /// issue commands on it; drop or `close()` it when done.
 pub struct Session {
   handle: Handle<ClientHandler>,
-  /// Tunnel chain kept alive for the lifetime of this session.
-  /// Innermost-first: `parents[0]` is this session's direct ProxyJump host.
+  /// Innermost-first; kept alive so tunneled transports don't drop.
   parents: Vec<Session>,
 }
 
@@ -221,12 +220,11 @@ impl Session {
     Self::finish_handshake(handle, cfg, Vec::new()).await
   }
 
-  /// Open an SSH session tunneled through `parent` (ProxyJump). The parent
-  /// keeps its transport alive for as long as the returned session lives.
+  /// Open an SSH session tunneled through `parent` (ProxyJump).
   pub async fn connect_via(parent: Session, cfg: &ConnectConfig) -> Result<Self> {
     let channel = parent
       .handle
-      .channel_open_direct_tcpip(cfg.host.clone(), u32::from(cfg.port), "", 0)
+      .channel_open_direct_tcpip(cfg.host.clone(), u32::from(cfg.port), "127.0.0.1", 0)
       .await
       .with_context(|| {
         format!(
@@ -358,9 +356,6 @@ impl Session {
     let (to_remote_tx, to_remote_rx) = flume::unbounded::<Vec<u8>>();
     let (resize_tx, resize_rx) = flume::unbounded::<(u16, u16)>();
 
-    // Move both the session handle and any tunneling parents into the relay
-    // task so the entire SSH chain stays alive for as long as the shell is
-    // in use.
     let task = tokio::spawn(relay_loop(
       self.handle,
       self.parents,

@@ -52,7 +52,6 @@ pub struct Host {
   pub port: u16,
   pub user: String,
   pub auth: HostAuth,
-  /// Name of another host in this book to tunnel through (ProxyJump). `None` = direct.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub proxy_jump: Option<String>,
 }

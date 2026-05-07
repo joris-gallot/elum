@@ -73,9 +73,7 @@ pub fn open<F>(
     NewAuth::Password { .. } => None,
   });
 
-  // Index 0 = sentinel "none"; subsequent indices map to `jump_host_names[i-1]`.
-  // The sentinel string is purely cosmetic; selection is read by index so a
-  // user host literally named "none" is unambiguous.
+  // Index 0 = sentinel; selection read by row index, not label, to allow a host literally named "none".
   let jump_host_names: Vec<String> = jump_hosts.iter().map(|h| h.name.clone()).collect();
   let jump_options: Vec<String> = std::iter::once("none".to_string())
     .chain(jump_host_names.iter().cloned())

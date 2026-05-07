@@ -1137,10 +1137,7 @@ fn is_encrypted_key_error(err: &anyhow::Error) -> bool {
     .any(|cause| cause.to_string().contains("The key is encrypted"))
 }
 
-/// Walk the ProxyJump chain rooted at `leaf` and return hops in
-/// connection order (root first, leaf last). Non-leaf hops resolve their
-/// auth via `parent_auth`; returns user-facing error strings on cycles,
-/// missing parents, or parents needing UI prompts.
+/// Returns hops in connection order (root first, leaf last).
 fn build_connect_chain<F>(
   hosts: &[Host],
   leaf: &Host,
@@ -1175,8 +1172,6 @@ where
   Ok(chain)
 }
 
-/// Returns an auth method for `host` if it can be resolved without prompting:
-/// unencrypted public keys, or secrets already stored in the OS keychain.
 fn resolve_non_interactive_auth(host: &Host) -> Option<AuthMethod> {
   match &host.auth {
     HostAuth::PublicKey {

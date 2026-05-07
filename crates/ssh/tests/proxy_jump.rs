@@ -1,10 +1,6 @@
-//! ProxyJump integration tests.
-//!
-//! Requires the local sshd container (`docker compose -f docker/sshd/compose.yml up -d`).
-//! The container proxies through itself: outer hop on the published
-//! `127.0.0.1:2222`, inner hop targets `localhost:22` from inside the
-//! container, which loops back to the same sshd. That's enough to
-//! exercise `channel_open_direct_tcpip` + `connect_stream` end-to-end.
+//! Requires `docker compose -f docker/sshd/compose.yml up -d`.
+//! Container loops through itself for the inner hop: `localhost:22` is
+//! resolved by the outer sshd, so it lands back on the same daemon.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,8 +35,6 @@ fn outer_config() -> ConnectConfig {
   )
 }
 
-/// Inner hop addresses are resolved by the *outer* sshd, so `localhost`
-/// here means the container's own loopback.
 fn inner_config() -> ConnectConfig {
   ConnectConfig::new(
     "localhost",
